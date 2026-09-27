@@ -30,14 +30,11 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      # fetch-depth: 0 是**必须**的：默认浅克隆（depth 1）抓 tag 时只留一个指向
-      # commit 的轻量引用，`git tag -l --format='%(contents)'` 于是读不到 annotated
-      # tag 的注解，Release 说明会静默回落成 commit message。
+      # fetch-depth: 0 抓全量历史；fetch-tags: true 让 tag 连同**注解对象**一起下来。
       #
-      # fetch-tags: true 同样**必须**：checkout 默认 `fetch-tags: false`，抓 tag 时
-      # 加 `--no-tags` —— 结果本地只有一个**轻量** ref 指向那个 commit，
-      # 注解对象根本没下来。此时 `%(contents)` 给出的是 **commit message**，
-      # 而它看起来"像那么回事"，所以这个坑不报错、只是说明悄悄变错（v0.1.0 就踩了）。
+      # ⚠️ 但这两条**都不足以**让后面读到注解：checkout 之后还会再来一抓把触发本次 run
+      #    的 tag 对齐到那个 commit（`fetch --no-tags ... +<sha>:refs/tags/<tag>`），
+      #    那一抓会把本地 tag 变成轻量 ref。所以 Release 说明改从 API 读（见最后一步）。
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -100,6 +97,15 @@ jobs:
 
       # 建 Release：tag 已存在 → --verify-tag；重复运行 → --clobber 覆盖附件。
       # 说明取自 tag 的 %(contents)：annotated tag 用你写的注解，轻量 tag 回落到 commit message。
+      # ⚠️ 别读本地那份注解 —— 读不到。checkout 抓完 tag 之后还会**再来一抓**
+      #    （CI 日志里那条 `fetch --no-tags --prune ... +<sha>:refs/tags/<tag>`，
+      #    目的是把 tag 对齐到触发本次 run 的那个 commit），代价是本地这个 ref 变成
+      #    **轻量**的、注解对象被覆盖掉，于是 `git tag -l --format='%(contents)'`
+      #    给出的是 **commit message**。它看起来"像那么回事"，所以这个坑不报错，
+      #    只让 Release 说明悄悄变错（v0.1.0、v0.1.1 都踩过；fetch-depth/fetch-tags
+      #    都救不了，因为问题出在那一抓，不在这一步）。
+      #    直接从 API 读 tag 对象，就与本地 ref 长什么样无关。
+      # 说明来源：annotated tag 用你写的注解；轻量 tag 没有注解 → --generate-notes。
       - name: 建 GitHub Release 并附 tgz
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -108,11 +114,34 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           TGZ="${{ steps.pack.outputs.tgz }}"
           NOTES_FILE="$(mktemp)"
-          git tag -l --format='%(contents)' "$TAG" > "$NOTES_FILE"
+
+          # 读 API 的小工具：**带重试**。一次失败就回落成 --generate-notes 的话，
+          # 说明会悄悄变成 "Full Changelog" —— 和"读本地注解"是同一类错误：
+          # 不报错，只是内容不对。
+          api_read() {
+            local out=""
+            for _ in 1 2 3; do
+              out="$(gh api "$1" --jq "$2" 2>/dev/null || true)"
+              if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+              sleep 2
+            done
+            return 1
+          }
+
+          OBJ_TYPE="$(api_read "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" '.object.type' || true)"
+          if [ "$OBJ_TYPE" = "tag" ]; then
+            OBJ_SHA="$(api_read "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" '.object.sha' || true)"
+            if [ -n "$OBJ_SHA" ]; then
+              api_read "repos/$GITHUB_REPOSITORY/git/tags/$OBJ_SHA" '.message' > "$NOTES_FILE" || true
+            fi
+          fi
+
           if [ -s "$NOTES_FILE" ]; then
             NOTES_ARG=(--notes-file "$NOTES_FILE")
+            echo "Release 说明：取自 tag 注解（$(wc -c < "$NOTES_FILE" | tr -d ' ') 字节）"
           else
             NOTES_ARG=(--generate-notes)
+            echo "⚠️ 读不到 tag 注解（轻量 tag，或 API 连续三次失败）→ 回落 --generate-notes"
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在 → 只覆盖附件"
