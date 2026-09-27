@@ -1,6 +1,6 @@
 {
   "name": "@yfwu2020/dsh-think-flow",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH 思维链可视化：把模型的实时思考按 turn → step →（思考原文 + 工具调用）聚合成可读的右侧栏视图",
   "type": "module",
   "main": "./lib/index.js",
