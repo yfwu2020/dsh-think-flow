@@ -1,0 +1,33 @@
+# ── 构建产物与依赖 ──
+node_modules/
+lib/
+*.tsbuildinfo
+*.log
+*.tgz
+
+# ─────────────────────────────────────────────────────────────────
+# 开发期资料：**只留本地**，不进公开仓库、也不进 npm 包。
+#
+# 为什么单列一段：这几处的产物一律**由真实会话渲染而来** —— 含本机路径、
+# 真人说过的话、会话 id。公开仓库只放插件本体、测试、合成演示数据（demo-*.mjs）
+# 与 README 截图。`.npmignore` 与本文件**故意保持一致**（两道门都要挡住）。
+# ─────────────────────────────────────────────────────────────────
+
+# 设计比选预览页与真机截图（由真实轨迹渲染）
+docs/
+
+# 真实会话轨迹夹具（extract-turn-index.mjs / build-trace-fixture.mjs 产出）
+scripts/fixtures/
+
+# 开发期的一次性脚本：设计比选生成器与各种探针，都依赖上面两类真实数据
+scripts/gen-*.mjs
+!scripts/gen-ui-preview.mjs
+!scripts/gen-readme-shots.mjs
+scripts/check-drive.mjs
+scripts/check-adjacent.mjs
+scripts/ring-glow-shared.mjs
+scripts/session-log.mjs
+scripts/title-probe.mjs
+scripts/cmd-title-probe.mjs
+scripts/extract-turn-index.mjs
+scripts/build-trace-fixture.mjs

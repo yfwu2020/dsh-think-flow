@@ -1,0 +1,117 @@
+name: publish
+
+# 发布到 npm —— 走 Trusted Publishing（OIDC），仓库里不留任何长期 token。
+#
+# 用法：
+#   1) 改 package.json 的 version（例如 0.1.0）
+#   2) 打同名 annotated tag 推上去：git tag -a v0.1.0 -m "..." && git push origin v0.1.0
+#   3) 本 workflow：校验 tag ↔ version → 装依赖 → 构建 → 跑测试 → 发布（带 provenance）→ 建 Release
+#
+# 前置条件（npm 网页上配一次）：
+#   npmjs.com → 包设置 → Trusted Publisher → GitHub Actions
+#     Organization or user : yfwu2020
+#     Repository           : dsh-think-flow
+#     Workflow filename    : publish.yml
+#     Allowed actions      : 勾选 npm publish（默认只允许 stage publish）
+#
+# ⚠️ workflow 文件名必须与 npm 上登记的一致（本文件 = publish.yml）。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: # 也允许手动触发（演练 / 重发）
+
+permissions:
+  contents: write # ← 建 GitHub Release 需要
+  id-token: write # ← OIDC 换取 npm 短期凭据所必需
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 是**必须**的：默认浅克隆（depth 1）抓 tag 时只留一个指向
+      # commit 的轻量引用，`git tag -l --format='%(contents)'` 于是读不到 annotated
+      # tag 的注解，Release 说明会静默回落成 commit message。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Node ≥ 22.14、npm ≥ 11.5.1 才能用 trusted publishing
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.14.0'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: 升级 npm 到支持 OIDC 的版本
+        run: npm install -g npm@^11.5.1
+
+      - name: 校验 tag 与 package.json version 一致
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG  package.json=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag v$TAG 与 package.json version $PKG 不一致"
+            exit 1
+          fi
+
+      # devDependencies 里钉了 @deepseek-ai/*（构建要它们的类型、测试要主题包）。
+      # 装完 node_modules/@deepseek-ai 是真实目录，build.sh 走"用本包 node_modules"那条路。
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund
+
+      - name: 构建（tsc 编译 host + 拷贝 client bundle）
+        run: bash scripts/build.sh
+
+      - name: 测试（trace / titles / routes / client，全部离线）
+        run: npm test
+
+      # 幂等：这个版本已经发过就跳过发布（tag 重推 / 手动重跑时不至于红一片）
+      - name: 这个版本在 npm 上是不是已经有了
+        if: startsWith(github.ref, 'refs/tags/')
+        id: check
+        run: |
+          V="$(node -p "require('./package.json').version")"
+          if npm view "@yfwu2020/dsh-think-flow@$V" version >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "$V 已在 npm 上，跳过发布"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 关键：不传 NODE_AUTH_TOKEN，让 npm CLI 自动检测 OIDC 环境。
+      - name: 发布到 npm（Trusted Publishing + provenance）
+        if: startsWith(github.ref, 'refs/tags/') && steps.check.outputs.already == 'false'
+        run: npm publish --access public --provenance
+
+      # 打 npm 包（与刚发布的同一份产物），作为 Release 附件
+      - name: 打包（Release 附件）
+        if: startsWith(github.ref, 'refs/tags/')
+        id: pack
+        run: echo "tgz=$(npm pack --silent)" >> "$GITHUB_OUTPUT"
+
+      # 建 Release：tag 已存在 → --verify-tag；重复运行 → --clobber 覆盖附件。
+      # 说明取自 tag 的 %(contents)：annotated tag 用你写的注解，轻量 tag 回落到 commit message。
+      - name: 建 GitHub Release 并附 tgz
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          TGZ="${{ steps.pack.outputs.tgz }}"
+          NOTES_FILE="$(mktemp)"
+          git tag -l --format='%(contents)' "$TAG" > "$NOTES_FILE"
+          if [ -s "$NOTES_FILE" ]; then
+            NOTES_ARG=(--notes-file "$NOTES_FILE")
+          else
+            NOTES_ARG=(--generate-notes)
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在 → 只覆盖附件"
+            gh release upload "$TAG" "$TGZ" --clobber
+          else
+            gh release create "$TAG" "$TGZ" --verify-tag --title "$TAG" "${NOTES_ARG[@]}"
+          fi
+          echo "Release: $(gh release view "$TAG" --json url --jq .url)"

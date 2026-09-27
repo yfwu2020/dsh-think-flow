@@ -1,0 +1,31 @@
+# dsh-think-flow bundle patch
+#
+# 本文件是包的 dsh.bundle.patch 层：官方 CLI 装配
+#   dsh plugin --profile <name> add @yfwu2020/dsh-think-flow
+# 会把本包加进 profile 的 dsh.profile.bundles，启动时合并下面的 insert 行。
+#
+# 可调参数（改 profile 的 cordis.patch.yml 里同 id 行即可覆盖）：
+#   maxTurnsPerSession          每个会话保留多少轮的**正文**（默认 20，0 = 不限）
+#                               ⚠️ 这是正文窗口，不是"能看到多少轮"：目录另由
+#                                  maxIndexTurns 限，所以面板里能翻到的轮次远多于 20
+#   maxIndexTurns               目录（全轮骨架）最多记多少轮（默认 2000，0 = 不限）
+#   coldTtlMs                   冷轮正文保留多久（默认 7,200,000 = 2 小时，0 = 不按时间收）
+#                               **空闲计时**：每读一次就续期，"正在读的那一轮"不会被抽走；
+#                               到点收回的是正文，骨架仍留在目录里
+#   maxColdChars                冷轮正文的**硬上限**（默认 4,000,000 字符，0 = 不限）
+#                               和 coldTtlMs 是两条独立策略、**谁先到算谁**：
+#                               时间到了收，字符超了从最旧的丢。
+#                               ⚠️ 时间策略本身没有内存上界（两小时里连开几百个老轮次一直涨），
+#                                  这道上限补的就是那个洞 —— 建议留着
+#   maxReasoningCharsPerStep    单个 step 的思考原文上限（默认 120000 字符，从尾部保留）
+#   maxSessions                 内存里最多跟踪多少个会话（LRU，默认 32）
+#   sseThrottleMs               合并推送的最小间隔（默认 120ms）。
+#                               实测 reasoning 每秒几百个事件，逐事件推会把浏览器刷死
+#   heartbeatMs                 SSE 心跳（默认 15000ms）
+#   snapshotTailChars           连接快照里给"当前步"带多少字符原文（默认 4000）
+- insert:
+    - id: think-flow
+      name: '@yfwu2020/dsh-think-flow'
+      config:
+        # 默认值即推荐值，一般不用改
+        sseThrottleMs: 120
