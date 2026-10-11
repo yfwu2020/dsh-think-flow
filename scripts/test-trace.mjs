@@ -133,14 +133,15 @@ console.log('\n④ 工具：在跑就是 waiting（本期的关键状态）')
   ok('有工具在跑 → waiting', stepStatus(turn.steps[0], turn) === 'waiting')
   ok('runningTool 能取到', runningTool(turn.steps[0]) && runningTool(turn.steps[0]).name === 'find_dsh_plugin')
 
-  // 真实数据里那 47 秒：结束时 resultChars 要记下来
+  // 真实数据里那 47 秒：结束时 resultTokens 要记下来
   applySessionEvent(t, {
     type: 'tool/result', time: T0 + 47000,
     data: { turn: 1, step: 8, message: { source: { callId: 'c1' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: 'abcdef' }] }] } },
   }, T0 + 47000)
   const tool = turn.steps[0].tools[0]
   ok('工具已结束', tool.endedAt === T0 + 47000)
-  ok('结果字符数被统计', tool.resultChars === 6, tool.resultChars)
+  // `abcdef` = 6 个 ASCII 字符 × 0.3 = 1.8 → 取整 2（口径见 trace.ts 的 tokenWeight）
+  ok('结果 Token 数被统计', tool.resultTokens === 2, tool.resultTokens)
   ok('没有工具在跑 → 回到 ready', stepStatus(turn.steps[0], turn) === 'ready')
 }
 
@@ -392,7 +393,7 @@ console.log('\n⑮ 真实帧形状（本次真机 bug 的回归：chunk 不带 t
 console.log('\n⑯ step/start：一步的时长必须含"想"的时间')
 {
   /**
-   * 真机事故：面板上出现刺眼的「长条 + 0.1s」—— 容量条编码的是**思考字数**（那个是真的），
+   * 真机事故：面板上出现刺眼的「长条 + 0.1s」—— 容量条编码的是**思考 Token**（那个是真的），
    * 旁边的秒数却只数了工具。因为聚合器没处理 `step/start`，一步的起点只能落到
    * `assistant/message`（模型**已经想完**、工具调用刚落盘那一刻）。
    *
@@ -420,7 +421,7 @@ console.log('\n⑯ step/start：一步的时长必须含"想"的时间')
   const s = lastTurn(t).steps[0]
   ok('时长 = 思考 + 工具（不是那 40ms 的工具）', s.endedAt - s.startedAt === 30050, s.endedAt - s.startedAt)
   ok('工具耗时单独看仍然是 40ms', s.tools[0].endedAt - s.tools[0].startedAt === 30, s.tools[0])
-  ok('字数还是真思考的字数（1000）', s.reasoning.length === 1000, s.reasoning.length)
+  ok('思考原文完整保留（1000 字符，不是被截断的空壳）', s.reasoning.length === 1000, s.reasoning.length)
   ok('宿主侧的 stepElapsed 同一个数', stepElapsed(s, T0 + 99999) === 30050, stepElapsed(s, T0 + 99999))
 }
 
@@ -438,18 +439,18 @@ console.log('\n⑯c 历史回放：没有流帧，时长口径也必须一致（
   /**
    * 面板后开 / 只读日志时，一条流帧都没有，只有耐久事件 —— 这正是截图的来源。
    * 旧口径下：一步的时长 = 纯工具耗时，于是「想得多、工具快」的那一步比
-   * 「没怎么想、工具慢」的那一步**更短**，条长（字数）和数字看着互相打架。
+   * 「没怎么想、工具慢」的那一步**更短**，条长（思考量）和数字看着互相打架。
    */
   const t = createTrace('s16c')
   const evs = [
     { type: 'turn/start', time: T0, data: { turn: 1 } },
-    // #1：想了 3700 字（≈ 条长 80%），工具只跑 100ms
+    // #1：想了 3700 字符（≈ 条长 80%），工具只跑 100ms
     { type: 'step/start', time: T0 + 100, data: { turn: 1, step: 1 } },
     { type: 'assistant/message', time: T0 + 9000, data: { turn: 1, step: 1, message: { content: [{ type: 'reasoning', text: 'x'.repeat(3700) }] } } },
     { type: 'tool/call', time: T0 + 9010, data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{}' } },
     { type: 'tool/result', time: T0 + 9110, data: { turn: 1, step: 1, message: { source: { callId: 'c1' }, content: [] } } },
     { type: 'step/end', time: T0 + 9120, data: { turn: 1, step: 1 } },
-    // #2：只想了 365 字（≈ 条长 48%），工具跑了 1.3s
+    // #2：只想了 365 字符（≈ 条长 48%），工具跑了 1.3s
     { type: 'step/start', time: T0 + 9130, data: { turn: 1, step: 2 } },
     { type: 'assistant/message', time: T0 + 9200, data: { turn: 1, step: 2, message: { content: [{ type: 'reasoning', text: 'y'.repeat(365) }] } } },
     { type: 'tool/call', time: T0 + 9210, data: { turn: 1, step: 2, callId: 'c2', name: 'bash', arguments: '{}' } },
@@ -464,8 +465,8 @@ console.log('\n⑯c 历史回放：没有流帧，时长口径也必须一致（
   ok('#2 时长 = 想 0.07s + 工具 1.3s', db === 1390, db)
   ok('两条口径一致（都从 step/start 起算）',
     a.startedAt === T0 + 100 && b.startedAt === T0 + 9130, [a.startedAt, b.startedAt])
-  // 这一条就是截图那个矛盾的回归：字数多 10 倍的那一步，时长不该反而更短
-  ok('字数多 10 倍的步，时长不再反而更短', da > db, [da, db])
+  // 这一条就是截图那个矛盾的回归：思考量多 10 倍的那一步，时长不该反而更短
+  ok('思考量多 10 倍的步，时长不再反而更短', da > db, [da, db])
 }
 
 console.log('\n⑯d step/start 的脏数据')
@@ -572,8 +573,8 @@ console.log('\n㊿b 工具失败：宿主说失败，面板就必须看得见')
   ok('错误类名也留着', tool.failed.name === 'ToolArgsError', tool.failed.name)
   ok('摘要是给人读的那句，且**去掉了 `Error: ` 前缀**',
     tool.failed.text.startsWith('invalid arguments:'), tool.failed.text)
-  ok('失败也要记结束时间与返回字数（结果确实回来了）',
-    tool.endedAt === T0 + 9 && tool.resultChars > 0, { endedAt: tool.endedAt, resultChars: tool.resultChars })
+  ok('失败也要记结束时间与返回 Token 数（结果确实回来了）',
+    tool.endedAt === T0 + 9 && tool.resultTokens > 0, { endedAt: tool.endedAt, resultTokens: tool.resultTokens })
 
   const end = ch.find((c) => c.k === 'tool-end')
   ok('增量里带上失败（面板不用等下次快照）', end && end.failed && end.failed.code === 'INVALID_ARGS', end)
@@ -751,6 +752,26 @@ console.log('\n㊿b 工具失败：宿主说失败，面板就必须看得见')
     data: { source: { kind: 'user' }, content: [{ type: 'text', text: '1、默认层没有出现 2、历史轮次没有默认层' }] },
   }, 1001)
   ok('轨迹里的 userText 已去掉序号', t.turns[0].userText === '默认层没有出现 2、历史轮次没有默认层', t.turns[0].userText)
+}
+
+// ───────────────────── 跳轮锚点：turn/start 的 seq ─────────────────────
+// 面板里点轮次号 → 主会话要"跳到这一轮"，轨迹页走的是宿主的
+// `session.loadThrough(seq)` —— 那个 seq 就是这一轮 `turn/start` 的事件序号。
+// 它必须随**骨架**下发（能跳的轮次往往正是正文还没取回来的那些）。
+{
+  const t = createTrace('s')
+  applySessionEvent(t, { type: 'turn/start', seq: 12, time: 1000, data: { turn: 1 } }, 1000)
+  applySessionEvent(t, { type: 'turn/start', time: 2000, data: { turn: 2 } }, 2000)
+  ok('turn/start 的 seq 记在轮上（跳轮锚点）', t.turns[0].seq === 12, t.turns[0].seq)
+  ok('没有 seq 的轮是 undefined（0 是个合法序号，不能拿 0 顶）', t.turns[1].seq === undefined, t.turns[1].seq)
+  ok('seq 不是数字时不当锚点（防脏数据）',
+    (() => {
+      const t2 = createTrace('s2')
+      applySessionEvent(t2, { type: 'turn/start', seq: 'x', time: 1, data: { turn: 1 } }, 1)
+      return t2.turns[0].seq === undefined
+    })())
+  applySessionEvent(t, { type: 'turn/start', seq: 34, time: 1000, data: { turn: 1 } }, 1000)
+  ok('重放同一条时 seq 跟着更新（和别的事实一致）', t.turns[0].seq === 34, t.turns[0].seq)
 }
 
 // ───────────────────── 汇总 ─────────────────────

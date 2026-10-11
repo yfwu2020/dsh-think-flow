@@ -16,8 +16,8 @@
  *     "SaaS 卡片套件"。现在是一条脊线（`.tf-rail`），步骤是线上的节点。
  *   · **阶段分组块**：一层 surface 把内容分组（分组，不是每步套卡）。
  *   · **当前步高亮**：整块淡蓝底 + 左侧蓝条 —— 唯一"响亮"的地方。
- *   · **每行一条容量条**（宽 = 那一步思考的字数）：它同时解决三件事 ——
- *     步骤行不再千篇一律、替代了打印字数、也替代了那条太弱的脊线。
+ *   · **每行一条容量条**（宽 = 那一步思考的 Token 数）：它同时解决三件事 ——
+ *     步骤行不再千篇一律、替代了打印 Token 数、也替代了那条太弱的脊线。
  *   · ⚠️ 重点色不能用 `--dsw-alias-brand-primary`：它浅色下是近黑（#0f1115）、
  *     深色下是近白（#f9fafb），**不是色相而是高对比前景色**。用错了就是"一片灰"。
  *     真正的产品蓝是 `--dsw-alias-state-business-primary`，淡底是 `-business-tertiary`。
@@ -58,6 +58,7 @@ window.__ModuleLoader__.load({
      * 分组等于失效。取 90 秒后只剩"工具族换向"在切分，22 步收敛成 4 个阶段。
      */
     var PHASE_GAP_MS = 90000
+
 
     // ────────────────────────────── 小工具 ──────────────────────────────
 
@@ -779,24 +780,72 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 没有标题时行里画的东西 —— **三个点**（`· · ·`）。
+     *
+     * 为什么不是 `…`：`…` 落在**基线**上，和同一行的字形 / 标题比、看着偏低
+     * （真机反馈："位置太低了"）；`·`（U+00B7）在中线上，和块头、和工具名一个高度。
+     * 为什么不是「无输出」那种占位词：它**长得就像个标题**（同一档字号、同一档灰），
+     * 而这一步什么产出都还没有 —— 拿一个词去冒充名字，和当初否掉"用本地规则猜中文标题"
+     * 是同一个错（错的标题比没有标题更危险）。
+     * 为什么三个点而不是一个字：**进行中时它们一个接一个亮**（见 CSS）——
+     * 那是"在等"，落地之后就静静躺着（只有还在跑的东西才说"在动"）。
+     *
+     * 三点分三个节点，就是为了这个错开的亮（一个字符串没法只让第二个点亮）。
+     */
+    var DOT = '·'
+
+    /**
+     * **只有思考、还没正文**时的行标题 —— 「思考」。
+     *
+     * 用户定的：这一步取不出名字（思考是英文 CoT、本地取不出中文名），
+     * 但它**确实产出了东西**（思考在涨），所以不画"空"的三个点，直说它在思考。
+     * ⚠️ 和块头次标题的「推理中」不是一回事：那是**状态**（还在跑），这是**这一步的产出**
+     *    ——落地之后块头改说分类名（纯推理），这一行仍然是「思考」。
+     */
+    var THINK_TITLE = '思考'
+
+    /** 这一步有没有收到过思考（`reasoning` 或活跃步的实时尾巴）。 */
+    function stepHasThinking(step) {
+      if (step === undefined || step === null) return false
+      return (step.reasoningTokens || 0) > 0
+        || (step.reasoningText !== undefined && step.reasoningText !== '')
+    }
+
+    /**
+     * 没有标题时，悬停里说明"为什么没有"。
+     *
+     * 只说事实（三个计数），不解释、不猜 —— 两种取不出名字的情况在这里是分开的：
+     * 0/0/0（这一步什么都没产出）与"只有思考、还没正文"。
+     * @param step - 步骤。
+     * @returns 悬停文字；步骤读不到时空串。
+     */
+    function noTitleNote(step) {
+      if (step === undefined || step === null) return ''
+      return stepHasThinking(step)
+        ? '只有思考，还没有正文'
+        : '这一步没有产出：0 思考、0 正文、0 工具'
+    }
+
+    /**
      * 一个**无工具**的步，行标题写什么。
      *
      *   有正文 → 正文摘要（`excerptOf`）
-     *   什么都没有（0 思考 0 正文 0 工具）→ 「无输出」
-     *   只有思考（还没开始写正文）→ 空串（不硬起名 —— 思考是英文 CoT，
-     *     本地取不出中文名；开了「生成标题」时模型标题会顶上）
+     *   没有正文 → 空串（取不出名字：0 思考 0 正文 0 工具，或只有思考还没写正文 ——
+     *     思考是英文 CoT，本地取不出中文名）
+     *
+     * ⚠️ 空串**不等于**"这一行没标题"：调用方（`renderStep`）会接着画
+     *    {@link THINK_TITLE}（有思考）或 {@link DOT} 那三个点（什么都没有）。
+     *    开过「生成标题」时模型标题会顶上。
      * @param step - 步骤。
-     * @returns 标题文字（可能为空串）。
+     * @returns 摘要文字（可能为空串）。
      */
     function stepOwnTitle(step) {
       if (step === undefined || step === null) return ''
-      if ((step.textChars || 0) > 0) {
+      if ((step.textTokens || 0) > 0) {
         var head = step.textHead !== undefined ? step.textHead : step.textTail
         return excerptOf(head === undefined ? '' : head)
       }
-      var noReasoning = (step.reasoningChars || 0) === 0 && (step.reasoningText === undefined || step.reasoningText === '')
-      var noTools = (step.tools || []).length === 0
-      return noReasoning && noTools ? '无输出' : ''
+      return ''
     }
 
     /** 单个命令段 → 标题。认不出来返回空串。 */
@@ -1089,7 +1138,7 @@ window.__ModuleLoader__.load({
      *   ① 它是**这一轮的最后一步** —— 中间步骤的正文只是"调用工具前的过渡语"，
      *      那确实是推理的一部分；只有最后一步的正文是**写给用户看的**；
      *   ② 没有工具调用（有工具的话它就是那件事，按工具族叫）；
-     *   ③ 真的产出了正文（`textChars > 0`）—— 只有思考没有正文的 11 轮不算，
+     *   ③ 真的产出了正文（`textTokens > 0`）—— 只有思考没有正文的 11 轮不算，
      *      完全空的 79 轮（多为命令轮 / 空转轮）也不算。
      * 另外要求它**已落地**：还在流式吐字时块头该说「推理中」——
      * 没落地的块不许用分类语法（见 `phaseLabel` 的说明）。
@@ -1105,9 +1154,11 @@ window.__ModuleLoader__.load({
       if ((lastStep.tools || []).length > 0) return false
       if (!stepSettled(lastStep)) return false
       if (phase.steps.indexOf(lastStep) < 0) return false
-      var chars = lastStep.textChars !== undefined ? lastStep.textChars
-        : (typeof lastStep.text === 'string' ? lastStep.text.length : 0)
-      return chars > 0
+      // 有正文 Token = 真的产出了正文；宿主没下发 Token 数（老快照）时退回"正文非空"，
+      // **不在这里再估一遍 Token**（估算口径只有宿主一份，见 TraceChange 的说明）。
+      var produced = (lastStep.textTokens || 0) > 0
+        || (typeof lastStep.text === 'string' && lastStep.text !== '')
+      return produced
     }
 
     /**
@@ -1209,7 +1260,7 @@ window.__ModuleLoader__.load({
        *
        * 它就是原来那一行统计行（同样的位置、同样的 padding 与下边框），
        * 只是把四个会话合计（共 N 轮 / 步骤 / 思考 / 工具）换成了"我在哪 + 这是什么 + 去哪"。
-       * 轮号与标题都是从轮头**搬上来**的 —— 所以轮头只剩步数/字数/工具 + 生成标题。
+       * 轮号与标题都是从轮头**搬上来**的 —— 所以轮头只剩步数/Token/工具 + 生成标题。
        */
       '.tf-nav{flex:0 0 auto;display:flex;flex-wrap:nowrap;align-items:center;gap:8px;padding:6px 11px;border-bottom:1px solid var(--dsw-alias-border-l2);font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-tertiary);min-width:0}',
       '.tf-nav b{color:var(--dsw-alias-label-secondary);font-weight:600;font-variant-numeric:tabular-nums}',
@@ -1367,6 +1418,39 @@ window.__ModuleLoader__.load({
        * ⚠️ 基础规则里那条 `box-shadow` **不能省**：降级（reduced-motion）时动画被关掉，
        *    静态的强光晕就是"这块是活的"最后一点提示 —— 和虚线底边同一个道理（形态，不是动画）。
        */
+      /*
+       * 空心环**发光** = **贴边光晕**（单层 box-shadow，跟着环一起呼吸）。
+       *
+       * 这条路走过三轮，别把前两轮的结论丢了：
+       *   ① 第一版：`0 0 6px/45%` 的光晕 + `scale(.7)`。用户说"不太好看" ——
+       *      实测病灶是**模糊半径（6px）比环（9px）还大**，浅色底上读作"环旁边一团脏蓝灰"，
+       *      指认不出光是从这个环发出来的。
+       *   ② 中间试过六套并排（`docs/ring-glow-options.html` / `-prototype.html`），
+       *      一度选定 ④ 流光（一道高光绕着环跑）。用户看完原型改主意：
+       *      **"去掉流光，还是改回第一版①贴边光晕，但是光晕要小一些，光强可以大一些"**。
+       *   ③ 现在这一版 = ① 的机制 + 两个参数按用户的话调：
+       *      · **光晕小一些**：模糊半径 6px → 3px（亮相位 8px → 3.5px），
+       *        加 0.5px spread 让近场有一点点硬边 —— 光贴着环，不再糊成一片；
+       *      · **光强大一些**：透明度 45/58/20% → 72/88/45%，
+       *        暗相位的 `opacity` .34 → .55（原来那一下几乎把环熄掉，"光强"就无从谈起）。
+       *      呼吸仍然是**三个量一起动**（透明度 / 尺寸 / 光晕）—— 那是第一版的形态，保留。
+       *   ④ 用户接着又说"**呼吸的频率低一些**"：周期 1.7s → **2.4s**（+41%，频率降约三成）。
+       *   ⑤ 然后是"**呼吸的幅度小一些**"：三个量的暗相位一起往亮相位靠（约收一半）——
+       *      opacity .55 → **.78**、scale .7 → **.88**、光晕 1.5px/45% → **2.6px/70%**。
+       *      亮相位（1 / 1 / 3.5px 88%）一个都不动：那是"光强"那一轮定下来的，
+       *      收幅度收的是**暗的那一头**，不是把灯调暗。
+       *
+       * ⚠️ 色值必须走 `--tf-hue` + `color-mix`：等待态把 `--tf-hue` 换成琥珀之后，
+       *    光晕得跟着变琥珀（写死蓝色的话，卡在工具上的那块会"蓝环发琥珀光"）。
+       *
+       * ⚠️ 基础规则里那条 `box-shadow` **不能省**：降级（reduced-motion）时动画被关掉，
+       *    静态的强光晕就是"这块是活的"最后一点提示 —— 和虚线底边同一个道理（形态，不是动画）。
+       *
+       * ⚠️ 2026-09 补记：一度换成宿主的鲸鱼尾巴 + 涟漪（`docs/whale-tail-options.html`
+       *    那五套比选稿选了 ⑤），随后按用户要求**撤回**，回到这一枚环。
+       *    那份落地代码与测试的取向留在 git 历史与比选稿里（`scripts/whale-tail-shared.mjs`），
+       *    组件这一处以本段为准。
+       */
       '.tf-phase.is-running .tf-bar{width:9px;height:9px;border-radius:50%;background:none;border:2px solid var(--tf-hue);box-shadow:0 0 3px 0 color-mix(in srgb, var(--tf-hue) 72%, transparent);animation:tf-ring 2.4s ease-in-out infinite}',
       // 呼吸：透明度 + 尺寸 + 光晕。周期 2.4s（"频率低一些"）；
       // 幅度收了一半（"幅度小一些"）—— 暗相位从 .55/.7/1.5px 收到 .78/.88/2.6px
@@ -1385,6 +1469,37 @@ window.__ModuleLoader__.load({
        *    （27px → 20px），否则它们会反超标题、戳到标题右边去。
        */
       '.tf-phase.is-running .tf-wait,.tf-phase.is-running .tf-cut,.tf-phase.is-running .tf-sub,.tf-phase.is-running .tf-raw,.tf-phase.is-running .tf-cap,.tf-phase.is-running .tf-reply{margin-left:20px}',
+      /*
+       * ── 进行中的块：标题文字上一道**微光扫过** ──
+       *
+       * 用户："进行中的块 除了 · · · ，其他标题文字都加上微光扫过的效果"。
+       * "其他标题"就是这一块里的全部标题：块头的「第 N 步」+ 状态词（推理中 / 调用中），
+       * 以及步骤行的标题（模型标题 / 派生标题 / 正文摘要 / 「思考」）。
+       * 步骤行的**工具名 chip** 不在内（那是工具身份，不是标题）；
+       * 三个点也不在内（`.is-dots`，它们自己有错开的亮）。
+       *
+       * 做法：把横向渐变**裁到文字上**（`background-clip:text`），基色取元素自己的
+       * `currentColor` —— 于是每一档灰、每一个分类色都原样保留，只有中间那道亮带在走。
+       * 亮带取 **`--tf-hue` 掺 `label-primary`**：跑着的块是蓝、等待态的块是琥珀 ——
+       * 和圆环、虚线底边同一套（`--tf-hue` 已经按状态换过档，这里不必再判一次）。
+       *
+       * 为什么亮带不是纯 `--tf-hue`：**琥珀掺进浅色底的灰字会把字读没**。按宿主真 token
+       * 算过（`test-client` ㊼）：纯琥珀掺 60% 时，最弱那一档（状态词）的对比度只有 **2.48**
+       * （门槛 3.0）；换成"琥珀 60% + label-primary"之后，浅色最差 **5.05**、深色最差 **9.11**，
+       * 而亮带与基色的色距最小仍有 **53** —— 扫过去那一道仍然看得见。
+       *
+       * ⚠️ 用 `-webkit-text-fill-color:transparent`，**不能**写 `color:transparent`：
+       *    `color` 一透明，渐变里的 `currentColor` 也跟着透明（基色整个没了）。只把
+       *    **字形填充**交给渐变，`color` 留着当基色。
+       * ⚠️ 渐变两端都停在 `currentColor`：`background-repeat` 默认 repeat，拼接处
+       *    基色接基色 → 扫动时看不出缝；也因此 `background-position` 走满一个图宽
+       *    （200% → -200% 共 2 个身位 = 一个图宽）正好无缝循环。
+       * ⚠️ 只动 `background-position`：字形宽度、行高、别的格子都不受影响。
+       */
+      '.tf-phase.is-running .tf-phase-name,.tf-phase.is-running .tf-phase-sub,.tf-phase.is-running .tf-step-title:not(.is-dots){background-image:linear-gradient(90deg,currentColor 0%,currentColor 42%,color-mix(in srgb, var(--tf-hue) 60%, var(--dsw-alias-label-primary)) 50%,currentColor 58%,currentColor 100%);background-size:200% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:tf-sweep 2.8s linear infinite}',
+      '@keyframes tf-sweep{from{background-position:100% 0}to{background-position:-100% 0}}',
+      /* 降级：微光整个撤掉 —— 一道**静止**的亮带挂在字上比不动更难看，字恢复原样 */
+      '@media (prefers-reduced-motion:reduce){.tf-phase.is-running .tf-phase-name,.tf-phase.is-running .tf-phase-sub,.tf-phase.is-running .tf-step-title:not(.is-dots){animation:none;background-image:none;-webkit-text-fill-color:currentColor}}',
       /* ── 步骤行：状态字形 + 编号 + 工具 + 容量条 + 耗时 ── */
       '.tf-step{padding:3px 7px;border-radius:6px;border-left:2px solid transparent}',
       '.tf-step+.tf-step{margin-top:1px}',
@@ -1395,6 +1510,18 @@ window.__ModuleLoader__.load({
       '.tf-step.is-wait .tf-glyph{color:var(--dsw-alias-state-warn-primary)}',
       '.tf-step.is-cut .tf-glyph{color:var(--dsw-alias-state-warn-primary)}',
       '.tf-no{font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;flex:0 0 auto;min-width:19px;text-align:right}',
+      /*
+       * 步骤号可点之后（用户："在轨迹页面点击步骤号可直接跳转并选中这一步"）。
+       *
+       * ⚠️ 它原来是 `<span>`，现在是 `<button>` —— 按钮那套默认样式（边框、底色、内边距、
+       *    字号）**必须**逐条清掉：`.tf-no` 是行首的定宽格（`min-width:19px` + 右对齐），
+       *    多出几个像素的默认内边距就会把整行的标题推开。
+       *    `box-sizing:border-box` 同样不能省（Chrome 里 `<button>` 默认就是它，
+       *    而同一句 `min-width` 在 content-box 上会量出更宽的值 —— 见 `.tf-turn-no` 那条）。
+       */
+      '.tf-no.is-locate{box-sizing:border-box;border:0;background:none;padding:0;margin:0;cursor:pointer;border-radius:3px}',
+      '.tf-no.is-locate:hover{color:var(--dsw-alias-label-primary)}',
+      '.tf-no.is-locate:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}',
       '.tf-step.is-live .tf-no,.tf-step.is-wait .tf-no{color:var(--dsw-alias-label-secondary)}',
       // 中文标题：填进行内的空白处（原来那段是空的），长了就省略号
       '.tf-step-title{font:var(--dsw-font-xs-13);color:var(--dsw-alias-label-secondary);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
@@ -1409,9 +1536,44 @@ window.__ModuleLoader__.load({
       '.tf-titles .tf-step-title{flex:0 0 auto}',
       '.tf-step-title.is-cmd{color:var(--dsw-alias-label-tertiary)}',
       '.tf-step.is-live .tf-step-title.is-cmd,.tf-step.is-wait .tf-step-title.is-cmd{color:var(--dsw-alias-label-secondary);font-weight:400}',
-      /* 本地摘要（无工具步）：和 `.is-cmd` 同一档灰 —— 读作"本地规则给的"，不冒充模型标题 */
-      '.tf-step-title.is-own{color:var(--dsw-alias-label-tertiary)}',
-      '.tf-step.is-live .tf-step-title.is-own,.tf-step.is-wait .tf-step-title.is-own{color:var(--dsw-alias-label-secondary);font-weight:400}',
+      /* 本地摘要（无工具步）：和 `.is-cmd` 同一档灰 —— 读作"本地规则给的"，不冒充模型标题。
+         `.is-none`（没有标题时那句「思考」/ 那三个点）跟着同一档：它同样不是模型写的。
+         ⚠️ 别给它做出一档新颜色：那会让一行"还没有"比标题还显眼。 */
+      '.tf-step-title.is-own,.tf-step-title.is-none{color:var(--dsw-alias-label-tertiary)}',
+      '.tf-step.is-live .tf-step-title.is-own,.tf-step.is-wait .tf-step-title.is-own,.tf-step.is-live .tf-step-title.is-none,.tf-step.is-wait .tf-step-title.is-none{color:var(--dsw-alias-label-secondary);font-weight:400}',
+      /*
+       * 三个点（`·` 在中线上 —— `…` 落在基线上，真机上看着太低）。
+       *
+       * **进行中时它们一个接一个亮**：那读作"在等"。三件事是有意这么定的：
+       *   ① 只有 `.is-live` / `.is-wait` 才动 —— 落地之后的空步**不该一直闪**
+       *      （面板一贯的规矩：只有还在跑的东西才说"在动"，见 `is-running` 那段）；
+       *   ② 静止时三个点同深（`.45` 那一档灰），不是"半亮半灭"——静止就该像个句号；
+       *   ③ 降级（reduced-motion）时**不动但仍然看得见**：三个点本身就是"这里没东西"
+       *      的形态，不必靠动画（和圆环那条降级同一个道理）。
+       * ⚠️ 动画只动 `opacity`：点的位置、行高、别的格子都不受影响（不给整行加宽）。
+       *
+       * ⚠️ 类名**不能叫 `.tf-dot`** —— 那个名字早就是错误胶囊里那枚 5px 小圆点在用
+       *    （`.tf-badge .tf-dot`）。同名的裸规则会漏到它身上（这里那条 `opacity:.45`
+       *    会让那枚圆点变半透明），所以另起一个名字，并且每条都收在
+       *    `.tf-step-title.is-none` 底下。
+       */
+      '.tf-step-title.is-none .tf-none-dot{display:inline-block;opacity:.45}',
+      '.tf-step-title.is-none .tf-none-dot+.tf-none-dot{margin-left:.16em}',
+      '@keyframes tf-none-dot{0%,70%,100%{opacity:.3}35%{opacity:1}}',
+      '.tf-step.is-live .tf-step-title.is-none .tf-none-dot,.tf-step.is-wait .tf-step-title.is-none .tf-none-dot{opacity:1;animation:tf-none-dot 1.5s ease-in-out infinite}',
+      /*
+       * 错开的亮（第二、第三个各晚一拍）。
+       *
+       * ⚠️ 这两条的选择器必须**和上面那条一样长**（`.tf-step.is-live …`）：上面是
+       *    `animation` **简写**，它会把 `animation-delay` 一并重置成 `0s` —— 而简写那条
+       *    有 5 个类，只写 `.tf-step-title.is-none .tf-none-dot:nth-child(2)`（4 个）
+       *    **压不过它**，三个点会一起亮（真踩到过：dump 出来三个都是 `+0s`）。
+       *    用相邻兄弟选择器凑到 6 个类，顺序 + 权重都赢，也不用 `:nth-child`
+       *    （那几个点是渲染出来的、不保证没有别的节点）。
+       */
+      '.tf-step.is-live .tf-step-title.is-none .tf-none-dot+.tf-none-dot,.tf-step.is-wait .tf-step-title.is-none .tf-none-dot+.tf-none-dot{animation-delay:.2s}',
+      '.tf-step.is-live .tf-step-title.is-none .tf-none-dot+.tf-none-dot+.tf-none-dot,.tf-step.is-wait .tf-step-title.is-none .tf-none-dot+.tf-none-dot+.tf-none-dot{animation-delay:.4s}',
+      '@media (prefers-reduced-motion:reduce){.tf-step.is-live .tf-step-title.is-none .tf-none-dot,.tf-step.is-wait .tf-step-title.is-none .tf-none-dot{animation:none;opacity:.45}}',
       '.tf-tool{font:var(--dsw-font-xxxs-11);font-family:var(--ds-font-family-code,ui-monospace,Menlo,monospace);color:var(--dsw-alias-label-tertiary);flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:38%}',
       '.tf-step.is-done .tf-tool{color:var(--dsw-alias-label-tertiary)}',
       '.tf-flag{font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-state-warn-label);flex:0 0 auto}',
@@ -1427,7 +1589,7 @@ window.__ModuleLoader__.load({
        * —— 失败归红、停住归琥珀，同一个判据。
        */
       '.tf-flag.is-err{color:var(--dsw-alias-state-error-primary)}',
-      /* 容量条：宽 = 这一步思考的字数。它同时承担"脊线"和"去重复"两个职责 */
+      /* 容量条：宽 = 这一步思考的 Token 数。它同时承担"脊线"和"去重复"两个职责 */
       '.tf-vol{margin-left:auto;width:52px;height:5px;border-radius:3px;background:var(--dsw-alias-border-l2);flex:0 0 auto;overflow:hidden}',
       /*
        * 填充色**不能**用 --dsw-alias-label-dimmed（#e1e5ee）：它和轨道
@@ -1493,6 +1655,19 @@ window.__ModuleLoader__.load({
          换成 `共 20 轮`（约 46px）时，不固定宽度的话前面那一组会缩 12px、搜索框跟着左移。
          56px 覆盖到三位数轮号；居中让 1~2 位数的轮号看起来也齐。 */
       '.tf-turn-no{font:var(--dsw-font-xxs-strong-12);color:var(--dsw-alias-label-secondary);flex:0 0 auto;min-width:56px;text-align:center}',
+      /*
+       * 轮次号可点之后（用户："点击轮次号 → 在主会话里定位到这一轮的用户消息"）。
+       *
+       * ⚠️ 它原来是 `<span>`，现在是 `<button>` —— 按钮那套默认样式（边框、底色、
+       *    内边距、字号）**必须**逐条清掉：这一格的宽度是"进/出历史态搜索框不跳变"
+       *    的基准（见 `.tf-turn-no` 上那条），字号或内边距一变，第二行整行都会挪。
+       *    `box-sizing:border-box` 也不能省 —— Chrome 里 `<button>` 默认是 border-box，
+       *    而同一句 `min-width` 在 content-box 的元素上会量出更宽的值（`.tf-turn-nav-b`
+       *    那条注释里记过同一个坑）。
+       */
+      '.tf-turn-no.is-locate{box-sizing:border-box;border:0;background:none;padding:0 1px;margin:0;cursor:pointer;border-radius:4px}',
+      '.tf-turn-no.is-locate:hover{color:var(--dsw-alias-label-primary)}',
+      '.tf-turn-no.is-locate:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}',
       '.tf-turn-h.is-current .tf-turn-no{color:var(--dsw-alias-label-primary)}',
       /*
        * 相邻轮次步进器（设计稿 docs/turn-adjacent-2.html 的 ②）：
@@ -1524,7 +1699,7 @@ window.__ModuleLoader__.load({
        *    轮头是列表项（显示历史时 20 轮同时在列），高度必须稳定 —— 宁可截断也不换行。
        */
       /* 轮头的标题那一行**搬到第二行**去了（见 .tf-nav .tf-turn-title），
-         轮头从此恒为一行：步数 / 字数 / 工具 + 生成标题 + 折叠箭头。 */
+         轮头从此恒为一行：步数 / Token / 工具 + 生成标题 + 折叠箭头。 */
       /*
        * 两种来源的对比（用户定的方向：AI 总结那条加黑，并要求"再明显一点"）。
        *
@@ -1580,7 +1755,7 @@ window.__ModuleLoader__.load({
       '.tf-recap-t{font:var(--dsw-font-xxs-strong-12);color:var(--dsw-alias-label-secondary)}',
       '.tf-recap-s{font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-tertiary);margin-top:3px;font-variant-numeric:tabular-nums}',
       /*
-       * 这一轮的小结：一条按字数分段的条 + 一份图例。
+       * 这一轮的小结：一条按 Token 分段的条 + 一份图例。
        *
        * ⚠️ 条**不按序号调透明度**。早先每段写 `opacity: 1 - 序号*0.14`，看着像
        * "越往后越淡"的设计，实际是：**第 8 段起就全是 0**（32 个阶段时 24 段不可见），
@@ -1716,19 +1891,21 @@ window.__ModuleLoader__.load({
       var step = null
       for (var j = 0; j < turn.steps.length; j += 1) if (turn.steps[j].step === c.step) step = turn.steps[j]
       if (!step) {
-        step = { step: c.step, reasoningChars: 0, textChars: 0, tools: [], status: 'thinking', startedAt: Date.now(), reasoningText: '' }
+        step = { step: c.step, reasoningTokens: 0, textTokens: 0, tools: [], status: 'thinking', startedAt: Date.now(), reasoningText: '' }
         turn.steps.push(step)
         turn.steps.sort(function (a, b) { return a.step - b.step })
       }
       if (c.k === 'reasoning') {
         step.reasoningText = (step.reasoningText || '') + c.text
-        step.reasoningChars = (step.reasoningChars || 0) + c.text.length
+        // ⚠️ **覆盖**而不是累加：宿主下发的是这一步**累计的 Token 数**（见 TraceChange 的说明）。
+        //    两端各取一次整必然漂（每个 chunk 分别取整会积累误差），所以口径只有一个 —— 宿主的。
+        if (c.tokens !== undefined) step.reasoningTokens = c.tokens
       } else if (c.k === 'text') {
         step.textTail = ((step.textTail || '') + c.text).slice(-2000)
         // 开头那一段也留着：**行标题的摘要取的是第一句**，而 textTail 是尾部
         // （正文一超过 2000 字，开头就没了）。见 stepOwnTitle。
         step.textHead = ((step.textHead || '') + c.text).slice(0, 160)
-        step.textChars = (step.textChars || 0) + c.text.length
+        if (c.tokens !== undefined) step.textTokens = c.tokens
       } else if (c.k === 'tool') {
         step.tools = step.tools || []
         if (!step.tools.some(function (t) { return t.id === c.tool.id })) step.tools.push(c.tool)
@@ -1737,7 +1914,7 @@ window.__ModuleLoader__.load({
         for (var k = 0; k < list.length; k += 1) {
           if (list[k].id === c.id) {
             list[k].endedAt = c.endedAt
-            list[k].resultChars = c.resultChars
+            list[k].resultTokens = c.resultTokens
             // 失败态照抄宿主（`{ code?, name?, text }`）；成功时 c.failed 是 undefined，
             // **不能**把已有的 failed 抹掉 —— 事件可能比快照晚到/重放。
             if (c.failed !== undefined) list[k].failed = c.failed
@@ -2001,8 +2178,26 @@ window.__ModuleLoader__.load({
 
       // 秒表：等待态的"已等 xx"要动，否则与卡死无法区分
       React.useEffect(function () {
-        var t = setInterval(function () { tick(function (n) { return n + 1 }) }, 500)
+        var t = setInterval(function () {
+          // 顺手自愈样式：元素被别处摘掉（上一代 dispose、宿主清 head）也能自己长回来。
+          // 一次 getElementById / 500ms，代价可以忽略；不做的话表现是**整块面板没样式**。
+          ensureCss()
+          tick(function (n) { return n + 1 })
+        }, 500)
         return function () { clearInterval(t) }
+      }, [])
+
+      /*
+       * 样式：面板在屏幕上时**自己再拿一份引用**。
+       *
+       * 为什么 apply 拿了一份还不够：热重载的中间态里，apply 那一代已经被 dispose 了，
+       * 而 React 树还没换掉（面板仍在屏幕上）。只靠 apply 那一份引用，样式会跟着
+       * 先走一步，面板就**裸奔**一小会儿 —— 真机上如果这一步卡住（那一代没再挂回来），
+       * 就是用户看到的"面板变成一堆浏览器默认按钮"。面板自己持一份，两边对齐。
+       */
+      React.useEffect(function () {
+        var hold = injectCss()
+        return function () { releaseCss(hold) }
       }, [])
 
       // SSE 连接
@@ -2012,64 +2207,94 @@ window.__ModuleLoader__.load({
         stateRef.current.sessionId = sessionId
         forceTick()
 
-        var es = new EventSource(API + '/stream?session=' + encodeURIComponent(sessionId))
-        es.onopen = function () { stateRef.current.connected = true; forceTick() }
-        es.onerror = function () { stateRef.current.connected = false; forceTick() }
-        es.onmessage = function (ev) {
-          var msg
-          try { msg = JSON.parse(ev.data) } catch (e) { return }
-          var st = stateRef.current
-          if (msg.t === 'snapshot') {
-            st.turns = (msg.snapshot && msg.snapshot.turns) || []
-            st.serverTime = msg.snapshot ? msg.snapshot.serverTime : 0
-            st.state = msg.snapshot ? msg.snapshot.state : undefined
-            // **全轮骨架**：比 turns 长得多。目录"看更早的轮次"读它，
-            // 所以 133 轮的会话不会只剩 20 轮可翻。老宿主不带这个字段 → 空数组，
-            // 目录入口自动退回"只有面板里这些轮"（不炸）。
-            st.index = Array.isArray(msg.snapshot && msg.snapshot.index) ? msg.snapshot.index : []
-            // 快照里的 reasoningTail 作为本地追加的起点
-            for (var i = 0; i < st.turns.length; i += 1) {
-              var steps = st.turns[i].steps || []
-              for (var j = 0; j < steps.length; j += 1) {
-                if (steps[j].reasoningTail !== undefined) steps[j].reasoningText = steps[j].reasoningTail
-              }
-              // 已生成过的标题随快照下发，刷新页面不用重算。
-              // 宿主给的是**按步骤号索引的对象**，直接用它，不按下标猜（下标对齐极易错位）。
-              var incoming = st.turns[i].titles
-              if (incoming !== undefined && incoming !== null && typeof incoming === 'object') {
-                titlesRef.current[skey(st.turns[i].turn)] = Object.assign({}, incoming)
-              }
-              // 空串 = 宿主"试过但没总结出东西" → 当没有，回落到默认素材（本轮用户消息）
-              if (st.turns[i].turnTitle !== undefined && st.turns[i].turnTitle !== null && String(st.turns[i].turnTitle) !== '') {
-                turnTitleRef.current[skey(st.turns[i].turn)] = String(st.turns[i].turnTitle)
-              }
-              var incomingNotes = st.turns[i].notes
-              if (incomingNotes !== undefined && incomingNotes !== null && typeof incomingNotes === 'object') {
-                for (var nk in incomingNotes) if (Object.prototype.hasOwnProperty.call(incomingNotes, nk)) notesRef.current[nk] = incomingNotes[nk]
-              }
-            }
-            st.connected = true
-            // 宿主侧是权威：宿主重启过就按它说的来
-            if (typeof msg.snapshot.auto === 'boolean') viewState.autoTitles = msg.snapshot.auto
-            st.autoBusy = msg.snapshot.autoBusy === true
-          } else if (msg.t === 'change') {
-            applyChange(st, msg.change)
-          } else if (msg.t === 'autoBusy') {
-            // 宿主说"这一批正在生成"——只在开了实时的时候才脉冲，别在关着的时候闪
-            st.autoBusy = msg.busy === true
-          } else if (msg.t === 'titles') {
-            // 自动标题是**推**过来的（不是我们请求的）：合并进缓存并重渲染
-            if (msg.turn !== undefined && msg.titles) {
-              titlesRef.current[skey(msg.turn)] = Object.assign({}, titlesRef.current[skey(msg.turn)] || {}, msg.titles)
-            }
-            if (msg.turnTitle !== undefined && String(msg.turnTitle) !== '') turnTitleRef.current[skey(msg.turn)] = String(msg.turnTitle)
-            if (msg.notes) {
-              for (var pk in msg.notes) if (Object.prototype.hasOwnProperty.call(msg.notes, pk)) notesRef.current[pk] = msg.notes[pk]
-            }
+        /**
+         * ⚠️ **自己管重连**，不能只把 `connected` 置 false 就等浏览器自己重试。
+         *
+         * 宿主那边会主动收流（LRU 淘汰会话、插件热重载），而浏览器那套自动重连
+         * 在服务端反复关闭之后会放弃 —— 表现是面板**永远停在最后一份数据**上，
+         * 偏偏"等工具"的秒表还在自己涨，看着就像任务卡死（实测：那一轮 40 分钟前
+         * 就中断了，面板还挂着"已等 59'46""）。
+         * 指数退避（1s → 2s → 5s → 10s 封顶），连上就归零。
+         */
+        var es = null
+        var retry = 0
+        var retryTimer = null
+        var stopped = false
+        var RETRY_MS = [1000, 2000, 5000, 10000]
+        var connect = function () {
+          if (stopped) return
+          es = new EventSource(API + '/stream?session=' + encodeURIComponent(sessionId))
+          es.onopen = function () { retry = 0; stateRef.current.connected = true; forceTick() }
+          es.onerror = function () {
+            stateRef.current.connected = false
+            forceTick()
+            try { es.close() } catch (e) { /* 已经断了 */ }
+            if (stopped) return
+            var wait = RETRY_MS[Math.min(retry, RETRY_MS.length - 1)]
+            retry += 1
+            retryTimer = setTimeout(connect, wait)
           }
-          forceTick()
+          es.onmessage = function (ev) {
+            var msg
+            try { msg = JSON.parse(ev.data) } catch (e) { return }
+            var st = stateRef.current
+            if (msg.t === 'snapshot') {
+              st.turns = (msg.snapshot && msg.snapshot.turns) || []
+              st.serverTime = msg.snapshot ? msg.snapshot.serverTime : 0
+              st.state = msg.snapshot ? msg.snapshot.state : undefined
+              // **全轮骨架**：比 turns 长得多。目录"看更早的轮次"读它，
+              // 所以 133 轮的会话不会只剩 20 轮可翻。老宿主不带这个字段 → 空数组，
+              // 目录入口自动退回"只有面板里这些轮"（不炸）。
+              st.index = Array.isArray(msg.snapshot && msg.snapshot.index) ? msg.snapshot.index : []
+              // 快照里的 reasoningTail 作为本地追加的起点
+              for (var i = 0; i < st.turns.length; i += 1) {
+                var steps = st.turns[i].steps || []
+                for (var j = 0; j < steps.length; j += 1) {
+                  if (steps[j].reasoningTail !== undefined) steps[j].reasoningText = steps[j].reasoningTail
+                }
+                // 已生成过的标题随快照下发，刷新页面不用重算。
+                // 宿主给的是**按步骤号索引的对象**，直接用它，不按下标猜（下标对齐极易错位）。
+                var incoming = st.turns[i].titles
+                if (incoming !== undefined && incoming !== null && typeof incoming === 'object') {
+                  titlesRef.current[skey(st.turns[i].turn)] = Object.assign({}, incoming)
+                }
+                // 空串 = 宿主"试过但没总结出东西" → 当没有，回落到默认素材（本轮用户消息）
+                if (st.turns[i].turnTitle !== undefined && st.turns[i].turnTitle !== null && String(st.turns[i].turnTitle) !== '') {
+                  turnTitleRef.current[skey(st.turns[i].turn)] = String(st.turns[i].turnTitle)
+                }
+                var incomingNotes = st.turns[i].notes
+                if (incomingNotes !== undefined && incomingNotes !== null && typeof incomingNotes === 'object') {
+                  for (var nk in incomingNotes) if (Object.prototype.hasOwnProperty.call(incomingNotes, nk)) notesRef.current[nk] = incomingNotes[nk]
+                }
+              }
+              st.connected = true
+              // 宿主侧是权威：宿主重启过就按它说的来
+              if (typeof msg.snapshot.auto === 'boolean') viewState.autoTitles = msg.snapshot.auto
+              st.autoBusy = msg.snapshot.autoBusy === true
+            } else if (msg.t === 'change') {
+              applyChange(st, msg.change)
+            } else if (msg.t === 'autoBusy') {
+              // 宿主说"这一批正在生成"——只在开了实时的时候才脉冲，别在关着的时候闪
+              st.autoBusy = msg.busy === true
+            } else if (msg.t === 'titles') {
+              // 自动标题是**推**过来的（不是我们请求的）：合并进缓存并重渲染
+              if (msg.turn !== undefined && msg.titles) {
+                titlesRef.current[skey(msg.turn)] = Object.assign({}, titlesRef.current[skey(msg.turn)] || {}, msg.titles)
+              }
+              if (msg.turnTitle !== undefined && String(msg.turnTitle) !== '') turnTitleRef.current[skey(msg.turn)] = String(msg.turnTitle)
+              if (msg.notes) {
+                for (var pk in msg.notes) if (Object.prototype.hasOwnProperty.call(msg.notes, pk)) notesRef.current[pk] = msg.notes[pk]
+              }
+          }
+            forceTick()
+          }
         }
-        return function () { try { es.close() } catch (e) { /* 已关 */ } }
+        connect()
+        return function () {
+          stopped = true
+          if (retryTimer !== null) clearTimeout(retryTimer)
+          try { es.close() } catch (e) { /* 已关 */ }
+        }
       }, [sessionId])
 
       /**
@@ -2079,18 +2304,18 @@ window.__ModuleLoader__.load({
        *   · **身份字段**（`userText` / `startedAt` / `title`）**宿主那份行优先**：
        *     它是宿主从轨迹里算出来的权威值，客户端那份是增量的投影。
        *     （`title` 例外：客户端收到的模型标题更新，比快照里的新。）
-       *   · **会长的计数**（步数 / 工具 / 字数）与收尾事实（`endedAt` 等）**窗口优先**：
+       *   · **会长的计数**（步数 / 工具 / Token）与收尾事实（`endedAt` 等）**窗口优先**：
        *     骨架里那一行是**连上那一刻**算的，这一轮还在跑，它已经旧了。
        */
       function skeletonRow(t, prev) {
         var steps = t.steps || []
         var tools = 0
-        var chars = 0
+        var tokens = 0
         var text = 0
         for (var i = 0; i < steps.length; i += 1) {
           tools += (steps[i].tools || []).length
-          chars += steps[i].reasoningChars || 0
-          text += steps[i].textChars || 0
+          tokens += steps[i].reasoningTokens || 0
+          text += steps[i].textTokens || 0
         }
         var mt = turnTitleRef.current[skey(t.turn)]
         return {
@@ -2105,8 +2330,8 @@ window.__ModuleLoader__.load({
           title: (mt !== undefined && mt !== null && String(mt) !== '') ? String(mt) : (prev ? prev.title : undefined),
           steps: steps.length,
           tools: tools,
-          reasoningChars: chars,
-          textChars: text,
+          reasoningTokens: tokens,
+          textTokens: text,
           inMemory: true,
         }
       }
@@ -2162,11 +2387,11 @@ window.__ModuleLoader__.load({
       /** 一个 turn 的派生量：统计、活跃步、阶段。 */
       function derive(t) {
         var list = t ? t.steps || [] : []
-        var chars = 0
+        var tokens = 0
         var tools = 0
         var active = null
         for (var i = 0; i < list.length; i += 1) {
-          chars += list[i].reasoningChars || 0
+          tokens += list[i].reasoningTokens || 0
           tools += (list[i].tools || []).length
           var s2 = list[i].status
           if (s2 === 'thinking' || s2 === 'waiting') active = list[i]
@@ -2180,7 +2405,7 @@ window.__ModuleLoader__.load({
         if (ap < 0 && ps.length) ap = ps.length - 1
         // 小结：同一类活动合并成一个（只有**最后统计**才合并，见 mergeByLabel 的说明）
         return {
-          list: list, chars: chars, tools: tools, active: active,
+          list: list, tokens: tokens, tools: tools, active: active,
           phases: ps, merged: mergeByLabel(ps), activePhase: ap,
         }
       }
@@ -2285,7 +2510,7 @@ window.__ModuleLoader__.load({
         // 工具名不放进悬停：chip 上已经写着它了
         var bits = []
         if (x.argsRaw) bits.push('参数：' + String(x.argsRaw).slice(0, 160))
-        if (x.resultChars !== undefined) bits.push('返回 ' + fmtK(x.resultChars) + ' 字')
+        if (x.resultTokens !== undefined) bits.push('返回 ' + fmtK(x.resultTokens) + ' tok')
         if (x.startedAt && x.endedAt) bits.push('耗时 ' + fmtDur(Math.max(0, x.endedAt - x.startedAt)))
         else if (x.endedAt === undefined) bits.push('执行')
         // 失败也进悬停：行里只有一枚红标（说"失败了"），**为什么**失败在这儿看
@@ -2404,16 +2629,19 @@ window.__ModuleLoader__.load({
       /**
        * 容量条比例：把"这一步想了多少"直接长进图形里。
        *
-       * 映射区间取 log10(字数) 的 1.3 → 4.2，即约 **20 字 ~ 1.6 万字**，映射到条宽的 8%~100%。
-       * ⚠️ 区间要按真实分布定：前 22 步的字数集中在 69~2564，若上限取 1 万字，
-       * 则条宽全挤在 55%~85%，一行行看着还是一样长（第一版就是这样）。
-       * ⚠️ 早先版本用节点直径表达，写成 `min(5, log10(chars) * 2.2)` —— 190 字就顶到上限，
-       * 实测 900 字和 1362 字的节点直径完全一样，这个编码等于没生效；而且圆点太弱，
-       * 用户反馈"脊线与圆点太弱、步骤行像日志"。改成横向容量条后两个问题一起解决。
+       * 映射区间取 log10(Token) 的 **1.0 → 3.2**，即约 **10 ~ 1600 Token**，
+       * 映射到条宽的 8%~100%。
+       * ⚠️ 区间按真实分布定：统计口径从字数换成 Token 之后，同一个 step 的数会**缩小**
+       *    （英文 0.3/字符、中文 0.6/字符），把原来的 1.3→4.2 直接套上去，条宽会全挤在
+       *    左下角（换口径第一版就是这样）。实测前 22 步的思考换算过来约 20~770 Token，
+       *    落在现在这个区间的 21%~87% —— 一行行看得出长短差别。
+       * ⚠️ 早先版本用节点直径表达，写成 `min(5, log10(n) * 2.2)` —— 换算前 190 字就顶到上限，
+       *    实测 900 字和 1362 字的节点直径完全一样，这个编码等于没生效；而且圆点太弱，
+       *    用户反馈"脊线与圆点太弱、步骤行像日志"。改成横向容量条后两个问题一起解决。
        */
-      function volRatio(chars) {
-        var c = Math.max(10, chars || 10)
-        var t = Math.max(0, Math.min(1, (Math.log10(c) - 1.3) / 2.9))
+      function volRatio(tokens) {
+        var n = Math.max(10, tokens || 10)
+        var t = Math.max(0, Math.min(1, (Math.log10(n) - 1.0) / 2.2))
         return Math.round(8 + t * 92)
       }
 
@@ -2447,7 +2675,28 @@ window.__ModuleLoader__.load({
          *    （对比：README 坑 19 讲的是**同一个列表里**条件渲染格子会挤歪整行，
          *     那条仍然成立 —— 这里变的是"哪一块"，不是"哪一行"。）
          */
-        if (!runningPhase) rowKids.push(React.createElement('span', { className: 'tf-no', key: 'no' }, '#' + step.step))
+        if (!runningPhase) {
+          /*
+           * **步骤号可点**：主会话在轨迹页时，跳过去并**选中这一步**（用户："在轨迹页面
+           * 点击步骤号可直接跳转并选中这一步"）。
+           *
+           * 为什么是 `<button>`：它是个动作，要能 Tab 到、回车触发、读屏念出来（和轮次号同一套）。
+           * ⚠️ 换成按钮后必须由 CSS 把按钮默认样式清干净（见 `.tf-no.is-locate`）——
+           *    这一格是行首的定宽格，内边距/字号一变整行都会挪。
+           * ⚠️ 必须 `stopPropagation`：这一行自己也点得动（展开/收起），不拦就会顺带展开。
+           */
+          rowKids.push(React.createElement('button', {
+            className: 'tf-no is-locate', key: 'no', type: 'button',
+            title: '在轨迹页里定位并选中第 ' + turnNo + ' 轮第 ' + step.step + ' 步',
+            'aria-label': '定位到轨迹页里第 ' + turnNo + ' 轮第 ' + step.step + ' 步',
+            onClick: function (ev) {
+              if (ev && ev.stopPropagation) ev.stopPropagation()
+              // 这一轮的 seq 一起给它（轨迹页翻历史要用；没有就退回"一页一页翻"）
+              var meta1 = indexOfTurn(turnNo)
+              locateMainStep(sessionId, turnNo, step.step, meta1 ? meta1.seq : undefined)
+            },
+          }, '#' + step.step))
+        }
         // 标题与工具名在 380px 里放不下两样：有标题时让工具名让位
         // （挤出来的 "ba…" 比不给还差），工具名移到 tooltip 与展开区。
         var titleOfStep = (titlesRef.current[skey(turnNo)] || {})[step.step]
@@ -2457,7 +2706,7 @@ window.__ModuleLoader__.load({
          * 它是**模型标题的替补**，不是"只给没思考的步"：
          *   · 还没点过「生成标题」→ **每一步都用它**当这一行的标题
          *   · 点过之后 → 有模型标题的步，模型标题占这一行，派生标题**退到展开区**
-         *     当次级标题（和工具原文一样，点开才看）；没有模型标题的步（比如 0 字的
+         *     当次级标题（和工具原文一样，点开才看）；没有模型标题的步（比如没有思考的
          *     纯工具步）仍然在行里用它
          */
         var titleLines = stepTitleLines(tools, notesRef.current)
@@ -2478,11 +2727,16 @@ window.__ModuleLoader__.load({
         } else if (tools.length === 0) {
           /**
            * **无工具步**：前面两条路都够不着它（派生标题要工具参数、模型标题要思考），
-           * 所以名字从**这一步自己的产出**里取（`stepOwnTitle`）：有正文 → 摘要，
-           * 什么都没有 → 「无输出」，只有思考（还没写正文）→ 不填。
+           * 所以名字从**这一步自己的产出**里取（`stepOwnTitle`）：有正文 → 摘要。
            *
-           * ⚠️ 这里是"不填"而不是"填个状态词"：块头已经写着「第 N 步 · 推理中」，
-           *    行里再写「思考中」就是同一件事说两遍（面板一贯的做法）。
+           * 取不出名字时看它**有没有在思考**分两种（用户定的）：
+           *   · 有思考（思考在涨，只是还没有正文）→ **「思考」**：它确实产出了东西，
+           *     不画"空"的点；
+           *   · 什么都没有（0 思考 0 正文 0 工具）→ **三个点**，进行中时它们
+           *     一个接一个亮（`.tf-none-dot` 的 stagger，见 CSS）—— 那读作"在等"。
+           * 两种都不写「无输出」那种看着像标题的占位词，也不写「思考中」那种状态词
+           * （块头已经写着「第 N 步 · 推理中」，行里那句是"产出"不是"状态"）。
+           * 悬停里说清"为什么没有"（`noTitleNote`）。
            */
           var ownTitle = stepOwnTitle(step)
           if (ownTitle !== '') {
@@ -2491,6 +2745,21 @@ window.__ModuleLoader__.load({
               // 悬停给全句（行里只有摘要）—— 摘要是截过的，原文要能看见
               title: cleanProse(step.textHead !== undefined ? step.textHead : (step.textTail || '')) || ownTitle,
             }, ownTitle))
+          } else if (stepHasThinking(step)) {
+            rowKids.push(React.createElement('span', {
+              className: 'tf-step-title is-none', key: 'ti',
+              title: noTitleNote(step),
+            }, THINK_TITLE))
+          } else {
+            // 三个点分三个节点：错开亮的那套动画只能这么写（一个字符串做不到）
+            // ⚠️ `.is-dots` 是给进行中块那道**微光扫过**留的排除标记（CSS 里 `:not(.is-dots)`）：
+            //    微光会把字形填充掀给渐变，三个点会一起闪、错开的亮就废了。
+            rowKids.push(React.createElement('span', {
+              className: 'tf-step-title is-none is-dots', key: 'ti',
+              title: noTitleNote(step),
+            }, [0, 1, 2].map(function (i) {
+              return React.createElement('span', { className: 'tf-none-dot', key: i }, DOT)
+            })))
           }
         } else {
           tools.forEach(function (x) {
@@ -2520,9 +2789,9 @@ window.__ModuleLoader__.load({
             title: failed.map(failLine).join('\n'),
           }, failed.length > 1 ? '工具失败×' + failed.length : '工具失败'))
         }
-        // 容量条：宽 = 这一步思考了多少。它同时替代了"脊线"和"每行印字数"
-        rowKids.push(React.createElement('span', { className: 'tf-vol', key: 'vol', title: fmtK(step.reasoningChars) + ' 字' },
-          React.createElement('i', { style: { width: volRatio(step.reasoningChars) + '%' } })))
+        // 容量条：宽 = 这一步思考了多少。它同时替代了"脊线"和"每行印 Token 数"
+        rowKids.push(React.createElement('span', { className: 'tf-vol', key: 'vol', title: fmtK(step.reasoningTokens) + ' tok' },
+          React.createElement('i', { style: { width: volRatio(step.reasoningTokens) + '%' } })))
         /**
          * 时长格：**只说时间，不说状态**。
          *
@@ -2546,13 +2815,13 @@ window.__ModuleLoader__.load({
          * 能不能展开。
          *
          * ⚠️ 不能只看"有没有思考原文"：**工具详情也只在展开时才给**（行内放不下）。
-         * 早先漏了 `tools.length`，于是纯工具步（形如 `#2 bash`、思考 0 字）没有箭头、
+         * 早先漏了 `tools.length`，于是纯工具步（形如 `#2 bash`、思考 0 Token）没有箭头、
          * 点不开 —— 明明有参数、返回大小、耗时可以看（用户反馈"怎么有的点不开"）。
          * ⚠️ 后来补了 `hasBody`：**回答步**（无工具、无思考、只有正文）原来也点不开，
          *    而正文恰恰是那一步唯一的产出（用户："展开区加正文"）。
          */
-        var hasReasoning = fullText !== undefined || (step.reasoningChars || 0) > 0
-        var hasBody = (step.textChars || 0) > 0
+        var hasReasoning = fullText !== undefined || (step.reasoningTokens || 0) > 0
+        var hasBody = (step.textTokens || 0) > 0
         var canExpand = hasReasoning || tools.length > 0 || hasBody
         /** 展开时是否需要去取（纯工具步不需要，省一次请求、也免得给个空块）。 */
         var needFetch = (hasReasoning || hasBody) && fullText === undefined && bodyText === undefined
@@ -2982,7 +3251,26 @@ window.__ModuleLoader__.load({
         if (n !== null) {
           kids.push(React.createElement('span', { className: 'tf-turn-nav', key: 'nav' },
             stepBtn(n, -1),
-            React.createElement('span', { className: 'tf-turn-no' }, '第 ' + n + ' 轮'),
+            /*
+             * **轮次号可点**：点了在主会话（对话 / 轨迹）里定位到这一轮的用户消息。
+             *
+             * 为什么是 `<button>` 而不是给 `<span>` 挂 onClick：它是个动作，要能 Tab 到、
+             * 能回车触发、读屏能念出来（`.tf-turn-nav-b` 那两枚箭头就是这么做的）。
+             * ⚠️ 换成按钮后**必须**由 CSS 把按钮默认样式清干净（见 `.tf-turn-no.is-locate`）：
+             *    这一格的宽度是"历史态搜索框不跳变"的基准，字号/内边距一变整行都会挪。
+             */
+            React.createElement('button', {
+              className: 'tf-turn-no is-locate', type: 'button',
+              title: '在主会话里定位第 ' + n + ' 轮的用户消息',
+              'aria-label': '定位到主会话里第 ' + n + ' 轮的用户消息',
+              onClick: function (ev) {
+                if (ev && ev.stopPropagation) ev.stopPropagation()
+                // 骨架里有这一轮的 seq（`turn/start` 的事件序号）就一起给它 ——
+                // 轨迹页靠它调宿主的 `loadThrough`（没有就退回一页一页翻）
+                var meta0 = indexOfTurn(n)
+                locateMainTurn(sessionId, n, meta0 ? meta0.seq : undefined)
+              },
+            }, '第 ' + n + ' 轮'),
             stepBtn(n, +1),
           ))
           kids.push(latestBtn(n))
@@ -3406,7 +3694,7 @@ window.__ModuleLoader__.load({
         var list = dd.list
         var key = String(t.turn)
         var open = turnOverride[key] !== undefined ? turnOverride[key] : isCurrent
-        var chars = dd.chars
+        var tokens = dd.tokens
         var tools = dd.tools
         var titleMapOfTurn = titlesRef.current[skey(t.turn)] || {}
         var hasTitlesOfTurn = Object.keys(titleMapOfTurn).length > 0
@@ -3420,18 +3708,18 @@ window.__ModuleLoader__.load({
         /*
          * ⚠️ 轮号（`.tf-turn-nav`）与标题（`.tf-turn-title`）**都不在这里** ——
          *    它们搬到了第二行的 `navRow()`。轮头从此恒为一行：
-         *    步数 / 字数 / 工具 + 生成标题 + 折叠箭头。
+         *    步数 / Token / 工具 + 生成标题 + 折叠箭头。
          */
         var headKids = [
           React.createElement('span', { className: 'tf-turn-meta', key: 'm' },
             React.createElement('span', null, list.length + ' 步'),
-            React.createElement('span', null, fmtK(chars) + ' 字'),
+            React.createElement('span', null, fmtK(tokens) + ' tok'),
             tools ? React.createElement('span', null, tools + ' 次工具') : null,
           ),
         ]
         /*
          * ⚠️ 「生成标题」与它的失败提示**都搬到了第二行**（占原来「历史」的位置）——
-         *    轮头从此只剩：步数 / 字数 / 工具 + 折叠箭头。
+         *    轮头从此只剩：步数 / Token / 工具 + 折叠箭头。
          */
         headKids.push(React.createElement('span', { className: 'tf-chev', key: 'c' }, open ? '▾' : '▸'))
 
@@ -3451,10 +3739,10 @@ window.__ModuleLoader__.load({
             var defaultClosed = isCurrent && liveTurnRef.current !== t.turn ? idx !== dd.activePhase : false
             var pkey = t.turn + ':' + idx
             var closed = phaseOverride[pkey] !== undefined ? phaseOverride[pkey] : defaultClosed
-            var pchars = 0
+            var ptokens = 0
             var ptools = 0
             for (var q = 0; q < phase.steps.length; q += 1) {
-              pchars += phase.steps[q].reasoningChars || 0
+              ptokens += phase.steps[q].reasoningTokens || 0
               ptools += (phase.steps[q].tools || []).length
             }
             var ranges = stepRanges(phase.steps)
@@ -3509,7 +3797,7 @@ window.__ModuleLoader__.load({
                    * 身份才轮到区间来报，那时它自己会回来。
                    */
                   phaseRunning ? null : React.createElement('span', { className: 'tf-span', title: '#' + ranges }, spanText),
-                  React.createElement('span', null, fmtK(pchars) + ' 字'),
+                  React.createElement('span', null, fmtK(ptokens) + ' tok'),
                   ptools ? React.createElement('span', null, ptools + ' 工具') : null,
                 ),
               ),
@@ -3523,18 +3811,18 @@ window.__ModuleLoader__.load({
           if (tFinished || tInterrupted) {
             var barTotal = 0
             for (var bi = 0; bi < dd.merged.length; bi += 1) {
-              for (var bj = 0; bj < dd.merged[bi].steps.length; bj += 1) barTotal += dd.merged[bi].steps[bj].reasoningChars || 0
+              for (var bj = 0; bj < dd.merged[bi].steps.length; bj += 1) barTotal += dd.merged[bi].steps[bj].reasoningTokens || 0
             }
             blocks.push(React.createElement('div', { className: 'tf-recap', key: 'recap' },
               React.createElement('div', { className: 'tf-recap-t' }, tInterrupted ? '这一轮被中断' : '这一轮想完了'),
               React.createElement('div', { className: 'tf-recap-s' },
-                list.length + ' 步，思考 ' + fmtK(chars) + ' 字，调用工具 ' + tools + ' 次'),
+                list.length + ' 步，思考 ' + fmtK(tokens) + ' tok，调用工具 ' + tools + ' 次'),
               React.createElement('div', { className: 'tf-recap-bars' },
                 dd.merged.map(function (ph, pi) {
                   var c = 0
-                  for (var q = 0; q < ph.steps.length; q += 1) c += ph.steps[q].reasoningChars || 0
+                  for (var q = 0; q < ph.steps.length; q += 1) c += ph.steps[q].reasoningTokens || 0
                   var w = barTotal ? (c / barTotal) * 100 : 0
-                  // 颜色 = 活动分类（与块、图例同一套），宽度 = 字数。
+                  // 颜色 = 活动分类（与块、图例同一套），宽度 = 该类的思考 Token。
                   // 不按序号调透明度（那会让后面的段直接看不见，见 CSS 里的说明）
                   return React.createElement('i', { key: pi, className: 'cat-' + ph.cat, style: { width: w + '%' } })
                 }),
@@ -3542,10 +3830,10 @@ window.__ModuleLoader__.load({
               React.createElement('div', { className: 'tf-recap-lg' },
                 dd.merged.map(function (ph, pi) {
                   var c = 0
-                  for (var q = 0; q < ph.steps.length; q += 1) c += ph.steps[q].reasoningChars || 0
-                  // 图例是**小结**：只给"哪类活动 + 多少字"（条的宽度就是这个数）。
+                  for (var q = 0; q < ph.steps.length; q += 1) c += ph.steps[q].reasoningTokens || 0
+                  // 图例是**小结**：只给"哪类活动 + 多少 Token"（条的宽度就是这个数）。
                   // 步骤区间在块头里（那里才有地方放），塞进来会把图例撑成一堵墙。
-                  // 0 字的块改报**步数**：报"0"看着像坏了，报"4 步"才说清
+                  // 0 Token 的块改报**步数**：报"0"看着像坏了，报"4 步"才说清
                   // "这类活干了 4 步、但没产出思考"。
                   return React.createElement('span', { key: pi, className: 'cat-' + ph.cat },
                     React.createElement('b', null),
@@ -3676,6 +3964,872 @@ window.__ModuleLoader__.load({
       return React.createElement(ThinkFlowTab, { key: id || 'no-session', sessionId: id })
     }
 
+    // ─────────────────── 主会话定位（点轮次号 → 跳到那一轮） ───────────────────
+    //
+    // 用户在面板第二行点「第 N 轮」→ **主会话**（对话 / 轨迹）滚到**这一轮的用户消息**。
+    //
+    // 两个页面各有一套落位机制，所以这里是两条路：
+    //   · **对话页**：宿主自己就有「轮次导航」刻度（每轮一枚 `button[data-index]`，
+    //     aria-label 是「跳转到第 N 轮」/「加载并跳转到第 N 轮」）—— 点那一枚 = 走宿主的
+    //     动作：**没载入的轮次它会自己把历史翻到那儿再落位**，落位点正是这一轮的起点
+    //     （用户消息，离视口顶 24px）。所以这一路我们只负责"把刻度找出来点掉"。
+    //   · **轨迹页**：宿主没有跳转能力。它还是**分页 + 虚拟滚动**的：屏幕外的行不在 DOM 里、
+    //     更早的历史根本没载入，行高又不齐（工具行 30px、消息行更高、折叠摘要 20px），
+    //     算不出偏移。只能自己来：**读着走** —— 按渲染出来的轮次边界二分收窄滚动位置，
+    //     收不动了就点一次「加载更早的历史」把窗口往前扩一页（见 `locateInTrajectory`）。
+    //
+    // ⚠️ **不替用户切视图**：用户说的是"主会话如果是在对话页面 / 轨迹页面"，在哪个页面
+    //    就在哪个页面里定位；两个都不是（他在看别的视图）时什么都不做 —— 硬切视图会
+    //    把他正在看的东西抢走。
+    //
+    // ⚠️ 两个页面都只在**没有渲染出目标行**时才动用"翻历史"那套：已经渲染出来的行直接滚，
+    //    一个字节的历史都不多取（真机上"点一下就翻掉几万像素"是会被察觉的）。
+
+    /**
+     * 宿主客户端 ctx（`apply` 时记下来）。
+     *
+     * 为什么放模块级：定位是**点击回调**触发的，回调在组件里，而组件拿不到 ctx
+     * （它是 `apply` 的参数）。只读用，不参与生命周期。
+     */
+    var ctxRef = null
+
+    /** 定位动作挂着的定时器：重新定位 / 面板卸载时要能全部取消（否则回调落在死节点上）。 */
+    var locateTimers = []
+
+    /** 延后一小步跑（可被 `locateStop()` 取消）。 */
+    function locateAfter(fn, ms) {
+      var id = setTimeout(function () {
+        var i = locateTimers.indexOf(id)
+        if (i >= 0) locateTimers.splice(i, 1)
+        fn()
+      }, ms)
+      locateTimers.push(id)
+      return id
+    }
+
+    /** 取消所有在飞的定位动作。 */
+    function locateStop() {
+      for (var i = 0; i < locateTimers.length; i += 1) clearTimeout(locateTimers[i])
+      locateTimers = []
+    }
+
+    /** 主会话的内容区（对话 / 轨迹共用的那一个容器）。 */
+    function mainContent() {
+      if (typeof document === 'undefined' || typeof document.querySelector !== 'function') return null
+      return document.querySelector('[data-conversation-content]')
+    }
+
+    /**
+     * 主会话现在显示的是哪个视图。
+     *
+     * 靠**视图自己的根节点**判断，不读标签文字：标签是本地化的（「对话」/「轨迹」），
+     * 而 `[data-trajectory-scroll]` / `[data-chat-turn]` 是宿主给视图的稳定标记。
+     * 两个视图是互斥挂载的（切走就卸载），所以在场的就是当前这个。
+     * @param content - `mainContent()` 的结果。
+     * @returns 'chat' | 'trajectory' | null（null = 没开会话 / 认不出来）。
+     */
+    function mainViewOf(content) {
+      if (content === null || content === undefined || typeof content.querySelector !== 'function') return null
+      if (content.querySelector('[data-trajectory-scroll]') !== null) return 'trajectory'
+      if (content.querySelector('[data-chat-turn], [data-chat-flow]') !== null) return 'chat'
+      return null
+    }
+
+    /** 轮询到一个条件成立为止（超时回 null）。`check()` 返回真值即结束。 */
+    function locateWaitFor(check, timeoutMs, done) {
+      var deadline = Date.now() + timeoutMs
+      function poll() {
+        var value = null
+        try { value = check() } catch (e) { value = null }
+        if (value) { done(value); return }
+        if (Date.now() >= deadline) { done(null); return }
+        locateAfter(poll, 80)
+      }
+      poll()
+    }
+
+    /** 宿主会话控制器（拿不到返回 null —— 宿主版本不同也不该把定位整条打死）。 */
+    function sessionOf(sessionId) {
+      if (!ctxRef || typeof ctxRef.get !== 'function' || !sessionId) return null
+      var sessions = null
+      try { sessions = ctxRef.get('sessions') } catch (e) { sessions = null }
+      if (!sessions || typeof sessions.binding !== 'function') return null
+      var binding = null
+      try { binding = sessions.binding(sessionId) } catch (e) { binding = null }
+      return binding && binding.session ? binding.session : null
+    }
+
+    // ── 对话页 ──────────────────────────────────────────────────────────
+
+    /**
+     * 第 n 轮在对话页里的那一行。
+     *
+     * 优先**用户消息**那一行（这一轮的起点就是它）；这一轮以别的节点开头
+     * （系统发起的轮 / 以上下文开头的轮）时退而取第一条属于它的行。
+     * @param content - 主会话内容区。
+     * @param n - 轮号。
+     * @returns 元素或 null（这一轮还没渲染）。
+     */
+    function chatTurnRow(content, n) {
+      if (!content || typeof content.querySelectorAll !== 'function') return null
+      var rows = content.querySelectorAll('[data-chat-turn="' + n + '"]')
+      var first = null
+      for (var i = 0; i < rows.length; i += 1) {
+        if (first === null) first = rows[i]
+        if (rows[i].dataset && rows[i].dataset.chatFlowKind === 'user') return rows[i]
+      }
+      return first
+    }
+
+    /** 刻度上的轮号：宿主下发的 aria-label 里唯一的那个数（本地化无关）。 */
+    function turnOfMark(mark) {
+      if (!mark || typeof mark.getAttribute !== 'function') return null
+      var label = mark.getAttribute('aria-label')
+      if (typeof label !== 'string') return null
+      var m = /(\d+)/.exec(label)
+      return m === null ? null : Number(m[1])
+    }
+
+    /** 在一组刻度里找代表第 n 轮的那一枚。 */
+    function markFor(marks, n) {
+      if (!marks) return null
+      for (var i = 0; i < marks.length; i += 1) if (turnOfMark(marks[i]) === n) return marks[i]
+      return null
+    }
+
+    /**
+     * 宿主「轮次导航」里代表第 n 轮的那一枚刻度。
+     *
+     * 刻度是**虚拟滚动**的（固定 10px 间距，只渲染视野里那几十枚），所以长会话里目标
+     * 常常不在 DOM 里 —— 那就先把轨道滚到目标附近再取一次。目标下标这么推：刻度按轮号
+     * 升序、一轮一枚，用两枚已知刻度线性外推；间距**量出来**（不写死 10px —— 那是宿主的
+     * 内部常量，改了不该让这里失效）。
+     *
+     * ⚠️ 窄容器下宿主的刻度轨道是 `display:none`（容器查询），这时轨道**根本不渲染刻度**
+     *    （虚拟滚动的可视高度是 0），量也量不到 —— 直接返回 null，交给"自己翻历史"那条兜底。
+     * @param content - 主会话内容区。
+     * @param n - 轮号。
+     * @returns 刻度元素或 null。
+     */
+    function railMarkOf(content, n) {
+      if (!content || typeof content.querySelectorAll !== 'function') return null
+      var marks = content.querySelectorAll('button[data-index]')
+      if (marks.length === 0) return null
+      var hit = markFor(marks, n)
+      if (hit !== null) return hit
+      var box = marks[0].parentElement
+      var scroller = box ? box.parentElement : null
+      if (!scroller || typeof scroller.getBoundingClientRect !== 'function') return null
+      var rect = scroller.getBoundingClientRect()
+      if (!rect || !rect.height) return null
+      var a = marks[0]
+      var b = marks[marks.length - 1]
+      if (typeof a.getBoundingClientRect !== 'function' || typeof b.getBoundingClientRect !== 'function') return null
+      var ia = Number(a.getAttribute('data-index'))
+      var ib = Number(b.getAttribute('data-index'))
+      var ta = turnOfMark(a)
+      var tb = turnOfMark(b)
+      if (ia !== ia || ib !== ib || ib === ia || ta === null || tb === null || tb === ta) return null
+      var pitch = (b.getBoundingClientRect().top - a.getBoundingClientRect().top) / (ib - ia)
+      if (!(pitch > 0)) return null
+      var target = ia + (n - ta) * (ib - ia) / (tb - ta)
+      scroller.scrollTop = Math.max(0, target * pitch - rect.height / 2)
+      // 滚完要等虚拟滚动重渲染一帧，这一帧里取不到就返回 null（调用方会兜底）
+      return markFor(scroller.querySelectorAll('button[data-index]'), n)
+    }
+
+    /** 把某一行滚进对话页的视口（顶部留 24px —— 和宿主自己刻度落位的位置一致）。 */
+    function scrollChatRow(content, row) {
+      var scroller = row && row.closest ? row.closest('[data-conversation-scroll]') : null
+      if (!scroller && content && typeof content.querySelector === 'function') scroller = content.querySelector('[data-conversation-scroll]')
+      if (!scroller || typeof scroller.scrollTop !== 'number' || typeof scroller.getBoundingClientRect !== 'function' ||
+          typeof row.getBoundingClientRect !== 'function') {
+        if (row && typeof row.scrollIntoView === 'function') row.scrollIntoView({ block: 'center' })
+        return
+      }
+      var delta = row.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+      scroller.scrollTop = Math.max(0, scroller.scrollTop + delta - 24)
+    }
+
+    /**
+     * 自己把第 n 轮滚到位。
+     *
+     * ⚠️ 要**写完再看一眼**：面板贴底跟随时宿主会把滚动位置写回尾部（它自己的跟随循环），
+     *    我们那一写可能被它盖掉。所以最多试三次，到位（离顶 0~120px）就收手。
+     */
+    function scrollChatRowTo(content, n, done) {
+      var tries = 0
+      function once() {
+        var row = chatTurnRow(content, n)
+        if (row === null) { done(null); return }
+        scrollChatRow(content, row)
+        tries += 1
+        if (tries >= 3) { done(chatTurnRow(content, n) || row); return }
+        locateAfter(function () {
+          var again = chatTurnRow(content, n)
+          if (again === null) { done(row); return }
+          var scroller = again.closest ? again.closest('[data-conversation-scroll]') : null
+          if (scroller && typeof again.getBoundingClientRect === 'function' && typeof scroller.getBoundingClientRect === 'function') {
+            var top = again.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+            if (top >= 0 && top <= 120) { done(again); return }
+          }
+          once()
+        }, 90)
+      }
+      once()
+    }
+
+    /**
+     * 用宿主会话控制器往前翻历史，直到 `check()` 成立（或翻不动了）。
+     *
+     * 这是**最慢**的一条路，只在宿主的刻度够不着时用（窄窗口下刻度轨道不渲染）。
+     * 上限两道：次数 + `snapshot.hasMore` —— 会话再大也不能把主线程占住。
+     */
+    function loadOlderUntil(sessionId, check, done) {
+      var session = sessionOf(sessionId)
+      if (session === null || typeof session.loadOlder !== 'function') { done(); return }
+      var left = 14
+      function once() {
+        if (check() || left <= 0) { done(); return }
+        left -= 1
+        var snap = null
+        try { snap = typeof session.getSnapshot === 'function' ? session.getSnapshot() : null } catch (e) { snap = null }
+        if (snap && snap.hasMore === false) { done(); return }
+        var p = null
+        try { p = session.loadOlder() } catch (e) { p = null }
+        if (!p || typeof p.then !== 'function') { locateAfter(once, 150); return }
+        p.then(function () { locateAfter(once, 60) }, function () { done() })
+      }
+      once()
+    }
+
+    /**
+     * 对话页的定位。
+     *
+     * 三条路，**从最轻的开始**：
+     *   ① 这一轮已经渲染出来了 → 自己滚（一个字节的历史都不多取）；
+     *   ② 没渲染 → 点宿主「轮次导航」里那一枚刻度（宿主自己翻历史 + 精确落位）；
+     *   ③ 连刻度都没有（窄窗口下轨道不渲染）→ 自己翻历史再滚。
+     */
+    /**
+     * 对话页的最后一条路：用宿主会话控制器往前翻历史，翻到这一轮渲染出来为止，再自己滚。
+     * 只在"刻度够不着"或"刻点点下去没反应"时走 —— 最慢，但点了总得有点用。
+     */
+    function locateChatByPaging(sessionId, content, n, done) {
+      loadOlderUntil(sessionId, function () { return chatTurnRow(content, n) }, function () {
+        scrollChatRowTo(content, n, function (row) { done(row !== null) })
+      })
+    }
+
+    function locateInChat(sessionId, content, n, done) {
+      if (chatTurnRow(content, n) !== null) {
+        scrollChatRowTo(content, n, function (row) { done(row !== null) })
+        return
+      }
+      var mark = railMarkOf(content, n)
+      if (mark !== null && typeof mark.click === 'function') {
+        mark.click()
+        // 宿主落位是异步的（要翻页、要等提交后的那一帧）——等那一行真的到位再收工
+        locateWaitFor(function () { return chatTurnRow(content, n) }, 5000, function (row) {
+          if (row !== null) { done(true); return }
+          /*
+           * ⚠️ 刻度点了**也可能没反应**（实测：`turnOutline` 投影是缓存下来的，刻度"以为"
+           *    有更早的轮次，宿主的跳转加载器却翻不动 —— 表现就是点下去什么都不发生）。
+           *    所以这一条不是"点了就交差"，它失败了还要走一遍"自己翻历史"。
+           */
+          locateChatByPaging(sessionId, content, n, done)
+        })
+        return
+      }
+      locateChatByPaging(sessionId, content, n, done)
+    }
+
+    // ── 轨迹页 ──────────────────────────────────────────────────────────
+
+    /** 轨迹行上的轮号：轮次起点那一行里有宿主给的一枚 `#N`（本地化无关的紧凑标签）。 */
+    function turnOfTrajRow(row) {
+      if (!row || typeof row.querySelectorAll !== 'function') return null
+      var spans = row.querySelectorAll('span')
+      for (var i = 0; i < spans.length; i += 1) {
+        var t = spans[i].textContent
+        if (typeof t === 'string' && /^#\d+$/.test(t)) return Number(t.slice(1))
+      }
+      return null
+    }
+
+    /** 某一个轮次起点行是不是第 n 轮的。 */
+    function trajTurnRow(pane, n) {
+      var rows = pane.querySelectorAll('tr[data-turn-start="true"]')
+      for (var i = 0; i < rows.length; i += 1) if (turnOfTrajRow(rows[i]) === n) return rows[i]
+      return null
+    }
+
+    /** 第 turn 轮第 step 步的助手行身份（宿主给的就是 `assistant\0轮\0步`）。 */
+    function trajStepKey(turn, step) {
+      return 'assistant\u0000' + turn + '\u0000' + step
+    }
+
+    /** 行上的身份（`data-trajectory-row-key` 是 URI 编码过的，解回来比）。 */
+    function trajRowKeyOf(row) {
+      var raw = row && row.dataset ? row.dataset.trajectoryRowKey : null
+      if (typeof raw !== 'string') return null
+      try { return decodeURIComponent(raw) } catch (e) { return raw }
+    }
+
+    /**
+     * 从一行解出它属于**(哪一轮的第几步)**。
+     *
+     * 这是宿主**自己写在行身份里**的（`assistant\0<轮>\0<步>`，折叠成摘要行时会再缀
+     * `\0summary\0assistant`）—— 所以"第几步"不用猜、也不用数：直接读。
+     * 不是助手行的（工具行是按 callId 命名的）返回 null。
+     * @returns `{turn, step}` 或 null。
+     */
+    function trajStepOf(row) {
+      var key = trajRowKeyOf(row)
+      if (key === null) return null
+      var m = /^assistant\u0000(\d+)\u0000(\d+)/.exec(key)
+      return m === null ? null : { turn: Number(m[1]), step: Number(m[2]) }
+    }
+
+    /** 按身份找那一行（虚拟滚动下可能没渲染 → null）。 */
+    function trajRowByKey(pane, key) {
+      var rows = pane.querySelectorAll('tr[data-trajectory-row-key]')
+      for (var i = 0; i < rows.length; i += 1) {
+        var k = trajRowKeyOf(rows[i])
+        if (k === key || (k !== null && k.indexOf(key + '\u0000') === 0)) return rows[i]
+      }
+      return null
+    }
+
+    /**
+     * 第 n 轮在轨迹里的**用户消息行**（找不到就是 null = 还没载入 / 这一轮没有）。
+     *
+     * ⚠️ **不能只认"轮次起点行"**：`data-turn-start` 是**视觉边界**，窗口从某一轮中间
+     *    开始时，那一段的第一行同样带着它（实测：第 1 轮的"起点行"是一条 `read_image`
+     *    工具行，它真正的用户消息还在更早处、根本没载入）。把这个工具行当用户消息落下去，
+     *    用户看到的就是"跳到了第 1 轮的工具调用"。
+     *
+     * 所以按**位置**认：在这一轮的边界行之后、下一轮的边界行之前，第一条 `data-kind=user`
+     * 的行；找不到就返回 null —— 调用方据此决定"继续往前翻历史"还是"尽力落在边界行上"。
+     * @param pane - 轨迹表格的滚动容器。
+     * @param n - 轮号。
+     * @returns 用户消息行或 null。
+     */
+    function trajUserRowFor(pane, n) {
+      var rows = pane.querySelectorAll('tr[data-trajectory-row-key]')
+      var inside = false
+      for (var i = 0; i < rows.length; i += 1) {
+        var row = rows[i]
+        var atStart = row.dataset && row.dataset.turnStart === 'true'
+        if (atStart) {
+          var t = turnOfTrajRow(row)
+          if (t !== null) {
+            if (t === n) inside = true
+            else if (inside || t > n) return null
+          }
+        }
+        if (inside && row.dataset && row.dataset.kind === 'user') return row
+      }
+      return null
+    }
+
+    /** 现在渲染出来的轮次边界范围（虚拟滚动下这就是"窗口里看得到的那一段"）。 */
+    function trajRenderedTurns(pane) {
+      var rows = pane.querySelectorAll('tr[data-turn-start="true"]')
+      var min = null
+      var max = null
+      for (var i = 0; i < rows.length; i += 1) {
+        var t = turnOfTrajRow(rows[i])
+        if (t === null) continue
+        if (min === null || t < min) min = t
+        if (max === null || t > max) max = t
+      }
+      return { min: min, max: max }
+    }
+
+    /** 轨迹页现在还有更早的历史没载入吗（那枚「加载更早的历史」还在就还有）。 */
+    function trajHasEarlier(pane) {
+      if (!pane || typeof pane.querySelector !== 'function') return false
+      return pane.querySelector('[data-history-load]') !== null
+    }
+
+    /**
+     * 目标轮**载入了没有**。
+     *
+     * 判据是**总览时间轴上那枚轮次边界**（`span[data-turn="n"]`）—— 它是宿主对**已载入
+     * 记录**建的模型，出现了就是载到了。比"滚上去看一眼表头"便宜得多，而且不需要动滚动位置。
+     *
+     * ⚠️ 时间轴整块没渲染出来（被折叠、或宿主版本里没有）时退回到"还有更早的历史吗"：
+     *    那样会一直载到会话开头才继续 —— 慢，但不会判错（宁慢不错）。
+     */
+    function trajTurnLoaded(content, n) {
+      if (!content || typeof content.querySelector !== 'function') return false
+      var pane = content.querySelector('[data-trajectory-scroll]')
+      // ① 表格顶上那枚「加载更早的历史」没了 = **已经载到头** —— 那就一定载入了。
+      //    ⚠️ 这一条必须在前面：总览时间轴是按**当前时间域**渲染边界的，用户缩放/拖动过
+      //    之后更早那些轮次的边界就**不在 DOM 里**了，只看时间轴会把"其实已经载入"
+      //    判成"还没载入"，于是永远停在"接着载"那一步（真机上就是点了没反应）。
+      if (pane === null || (pane.querySelector && pane.querySelector('[data-history-load]') === null)) return true
+      // ② 还有更早的历史：那看这一轮的边界在不在时间轴上
+      return content.querySelector('span[data-turn="' + n + '"]') !== null
+    }
+
+    /**
+     * 轨迹页的定位（**唯一没有宿主能力可借**的一条路）。
+     *
+     * 三件事叠在一起：
+     *   · **分页**：更早的历史根本没载入（表格顶部那枚「加载更早的历史」是入口）；
+     *   · **虚拟滚动**：载入 ≠ 渲染，屏幕外的行不在 DOM 里（一百多行只挂几十行）；
+     *   · **行高不齐**（工具行 30px、消息行更高、折叠摘要 20px）—— 算不出"第 N 行在多少像素处"。
+     *
+     * 所以分两段：
+     *   ① **先保证载入** —— `session.loadThrough(seq)`（宿主的跳转加载器，一次到位），
+     *      没 seq 或它没管用时连点表格顶部那枚「加载更早的历史」；每次载入之间**不等**
+     *      渲染（实测：连点每页 60ms 就绪，16 页 ≈ 1 秒；一页一等渲染要十几秒）。
+     *      停的条件看时间轴那枚 `span[data-turn="n"]`（见 `trajTurnLoaded`）。
+     *   ② **再滚动落位** —— 读渲染出来的轮次边界二分收窄；视野里一条边界都没有（整段落在
+     *      长轮次内部）就往窗口头走（窗口首行永远带轮次标记）。
+     *
+     * ⚠️ **滚到顶会自己往前载入历史**（实测：把滚动位置写到 0，一帧之后 `scrollHeight`
+     *    从 1674 涨到 3174，没人点那枚按钮），而且载入完按"读到的位置"补偿滚动 ——
+     *    所以落位要**看两眼**：内容被顶走就重来（见 `land`）。
+     *
+     * 上限是硬的（步数 + 总时长）：轨迹页再大也不能把主线程占住；超了就**什么都不做**
+     *（宁可不动，也不要乱跳一通把人看晕）。
+     */
+    function locateInTrajectory(sessionId, content, n, stepNo, seq, done) {
+      var pane = content && typeof content.querySelector === 'function' ? content.querySelector('[data-trajectory-scroll]') : null
+      if (!pane) { done(false); return }
+      var started = Date.now()
+      var steps = 0
+      var lo = 0
+      var hi = Math.max(0, pane.scrollHeight - pane.clientHeight)
+      /**
+       * 目标行：轮的目标 = 这一轮的用户消息行；步的目标 = 那一步的助手行（身份里带轮和步）。
+       *
+       * ⚠️ 参数**不能叫 `step`** —— 它会和下面那个 `function step()`（机器的主循环）重名，
+       *    而函数声明会被提升并**覆盖同名参数**：`step` 于是变成函数对象，`stepNo === null`
+       *    永远不成立，整个搜索跑的是"找一步叫 function 的步"（真踩到过：点了没反应）。
+       */
+      var wantKey = stepNo === null || stepNo === undefined ? null : trajStepKey(n, stepNo)
+      /** 宿主的跳转加载器试过了没有（只试一次）。 */
+      var jumped = false
+      /** "窗口头比目标还晚"连续出现了几次（防在某一个状态上来回打转）。 */
+      var stuck = 0
+
+      /** 把某一行滚到视口中间（自己写 scrollTop —— 不用 `scrollIntoView` 的平滑滚动，
+          它和"载入之后按位置补偿"那一套会抢滚动位置）。 */
+      function centerRow(row) {
+        if (!row || typeof row.getBoundingClientRect !== 'function' ||
+            typeof pane.getBoundingClientRect !== 'function') return
+        var pr = pane.getBoundingClientRect()
+        var rr = row.getBoundingClientRect()
+        var want = pane.scrollTop + (rr.top - pr.top) - Math.max(0, (pane.clientHeight - rr.height) / 2)
+        pane.scrollTop = Math.max(0, want)
+      }
+
+      /** 这一行现在是不是整个都在视野里。 */
+      function onScreen(row) {
+        if (!row || typeof row.getBoundingClientRect !== 'function') return false
+        var pr = pane.getBoundingClientRect()
+        var rr = row.getBoundingClientRect()
+        return rr.top >= pr.top - 4 && rr.bottom <= pr.bottom + 4
+      }
+
+      /**
+       * **选中**这一行 —— 走宿主自己的选中动作（点它一下）。
+       *
+       * 这就是轨迹页的"选中一轮"：行变成 `data-selected`、轮次标签高亮、右边检查器打开这一条，
+       * 而且宿主的 `activeTurn` 就是从**选中的那条记录**推出来的（时间轴/轮轨跟着高亮这一轮）。
+       * 比我们自己加个底色对得多：选中态是**宿主的**，它自己知道怎么画、也不会跟别的状态打架。
+       * ⚠️ 用 `click()`（真事件）而不是改 DOM：状态在 React 里，只有走它的事件才算数。
+       */
+      function selectRow(row) {
+        if (!row) return
+        if (typeof row.click === 'function') { row.click(); return }
+        if (typeof row.dispatchEvent === 'function' && typeof MouseEvent === 'function') {
+          row.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+        }
+      }
+
+      /**
+       * 落位：滚到中间 → 等它稳下来 → 还在视野里才算到，然后**选中它**。
+       * 每一轮都**重新按轮号取一次行**：载入历史会把行整体重挂，旧节点会失效。
+       *
+       * ⚠️ 落位之后**内容可能被顶走**（往前载入 → 补偿滚动）。校正两轮还不稳，就
+       *    **整轮搜索重来一次** —— 载入之后窗口变了，不该拿着旧坐标硬凑。
+       */
+      function targetRow() {
+        if (wantKey !== null) return trajRowByKey(pane, wantKey)
+        return trajUserRowFor(pane, n)
+      }
+
+      function land() {
+        var tries = 0
+        function settle() {
+          var row = targetRow() || trajTurnRow(pane, n)
+          centerRow(row)
+          tries += 1
+          locateAfter(function () {
+            var row2 = targetRow() || trajTurnRow(pane, n)
+            if (row2 !== null && onScreen(row2)) { selectRow(row2); done(true); return }
+            if (tries <= 2) { settle(); return }
+            lo = 0
+            hi = Math.max(0, pane.scrollHeight - pane.clientHeight)
+            locateAfter(step, 150)
+          }, 260)
+        }
+        settle()
+      }
+
+      /**
+       * 把滚动位置顶到窗口最上面（窗口首行永远带轮次标记，是"知道窗口最早载到哪一轮"的唯一位置）。
+       * 滚到顶可能触发一次"往前载入"，载入完会把它推下去一截 —— 等一等再继续。
+       */
+      function goTop() {
+        var height0 = pane.scrollHeight
+        pane.scrollTop = 0
+        locateAfter(function () {
+          lo = 0
+          hi = Math.max(0, pane.scrollHeight - pane.clientHeight)
+          if (pane.scrollHeight === height0) { step(); return }
+          locateAfter(step, 120)
+        }, 260)
+      }
+
+      /** 连点「加载更早的历史」载下一页（每页 60ms 就绪 —— **不等渲染**）。点不动返回 false。 */
+      function pageEarlier() {
+        if (!trajHasEarlier(pane)) return false
+        var host = pane.querySelector('[data-history-load]')
+        var btn = host && (typeof host.querySelector === 'function' ? (host.querySelector('button') || host) : host)
+        if (!btn || btn.disabled || typeof btn.click !== 'function') return false
+        btn.click()
+        return true
+      }
+
+      /**
+       * 借宿主的**跳转加载器**把历史翻到这一轮（`session.loadThrough(seq)`）。
+       *
+       * 和「轮次导航」刻度点下去是**同一个调用**：宿主自己按 500 条一页地翻、翻完一起发布。
+       * 失败（宿主版本没有 / seq 缺失 / RPC 出错）就退回"一页一页点"那条路。
+       */
+      function jumpThrough() {
+        var session = sessionOf(sessionId)
+        if (seq === undefined || seq === null || session === null || typeof session.loadThrough !== 'function') return false
+        jumped = true
+        var p = null
+        try { p = session.loadThrough(seq) } catch (e) { p = null }
+        var next = function () {
+          locateAfter(function () {
+            lo = 0
+            hi = Math.max(0, pane.scrollHeight - pane.clientHeight)
+            step()
+          }, 80)
+        }
+        if (p && typeof p.then === 'function') { p.then(next, next); return true }
+        next()
+        return true
+      }
+
+      /**
+       * 窗口现在是不是**停在这一轮里**。
+       *
+       * ⚠️ 不能只看"轮次起点行在不在" —— 长轮次里滚到中间时，那一行早就出视野了
+       *    （而它恰恰是唯一的轮次路标）。助手行的身份里也带着轮号，所以"看得见这一轮的
+       *    任何一行"就算在里面 —— 判据放宽到那一层，步的搜索才不会被拽回顶部重来
+       *    （真踩到过：跳下去 → 判不出在里面 → `goTop()` 又拽回 0，来回弹）。
+       */
+      function insideTurn() {
+        if (trajUserRowFor(pane, n) !== null || trajTurnRow(pane, n) !== null) return true
+        var rows = pane.querySelectorAll('tr[data-trajectory-row-key]')
+        for (var i = 0; i < rows.length; i += 1) {
+          var m = trajStepOf(rows[i])
+          if (m !== null && m.turn === n) return true
+        }
+        return false
+      }
+
+      /**
+       * 兜底扫描的游标（null = 还没开始扫）。
+       *
+       * 为什么要有这条路：下面那套二分**假设记录按轮号升序**（`trajRenderedTurns`
+       * 给出渲染区间、再朝目标二分）。可宿主那份记录在**压缩过的会话**上不一定升序 ——
+       * 实测同一个会话里时间轴上的轮次边界是 `3,4,1,5,6`，于是二分一步都走不动
+       * （点轮次号没反应）。扫一遍虽然笨，但**与顺序无关**，再拿步数/时间上限兜住。
+       */
+      var scanAt = null
+
+      /** 该放弃了吗：还有没扫过的地方就从头扫一遍，否则真放手。 */
+      function giveUpOrScan() {
+        if (scanAt === null) {
+          scanAt = 0
+          locateAfter(step, 0)
+          return
+        }
+        done(false)
+      }
+
+      /** 行顶部相对表格的绝对位置（用来按路标跳）。 */
+      function offOf(row) {
+        var pr = pane.getBoundingClientRect()
+        var rr = row.getBoundingClientRect()
+        return pane.scrollTop + (rr.top - pr.top)
+      }
+
+      /**
+       * 按**(轮, 步) 路标**滚一步 —— 只用在"步"这个目标上。
+       *
+       * 长轮次里（实测第 1 轮 179 步、三百多行）目标行往往在窗口外，而虚拟滚动只挂视野里
+       * 那几十行。助手行的身份里带着步号，所以方向不用猜：把渲染出来的助手行按步号分到
+       * 目标两侧，朝有路标的那一侧跳一整屏（两侧都有 = 目标夹在中间，跳到两者中点）。
+       * @returns 滚过了返回 true（调用方重来一步）。
+       */
+      function stepJump() {
+        var rows = pane.querySelectorAll('tr[data-trajectory-row-key]')
+        var above = null
+        var below = null
+        for (var i = 0; i < rows.length; i += 1) {
+          var m = trajStepOf(rows[i])
+          if (m === null || m.turn !== n) continue
+          if (m.step < stepNo) { if (above === null || m.step > above.step) above = { step: m.step, row: rows[i] } }
+          else if (m.step > stepNo) { if (below === null || m.step < below.step) below = { step: m.step, row: rows[i] } }
+        }
+        if (above === null && below === null) return false
+        var want
+        if (above !== null && below !== null) want = (offOf(above.row) + offOf(below.row)) / 2 - pane.clientHeight / 2
+        else if (above !== null) want = offOf(above.row)
+        else want = offOf(below.row) - pane.clientHeight + 60
+        pane.scrollTop = Math.max(0, Math.round(want))
+        return true
+      }
+
+      function step() {
+        steps += 1
+        if (steps > 90 || Date.now() - started > 15000) { done(false); return }
+        // ① 目标行已经渲染出来了 —— 直接落位（一个字节的历史都不多取）
+        if (targetRow() !== null) { land(); return }
+        /*
+         * ①' 目标是**某一步**、而那一轮已经在视野里了 —— 按 (轮, 步) 路标往里走。
+         *
+         * 步的搜索要在**轮已经就位**之后做：轮的定位把那一段历史翻出来、把窗口挪过去，
+         * 之后"差的步"通常就在附近几十行内（`stepJump` 一跳一屏）。
+         * 轮的搜索照旧走下面那套 —— 只是**命中条件换成"那一步的行"**，找到轮不算找到。
+         */
+        if (wantKey !== null && insideTurn()) {
+          if (stepJump()) { locateAfter(step, 100); return }
+          giveUpOrScan()
+          return
+        }
+        /*
+         * ①'' 兜底扫描：二分那套走不动了 —— 按**位置**从头到尾扫一遍（与顺序无关）。
+         * 一旦进入这条路就只扫描：每步挪大半个视口，直到扫到底或超上限。
+         */
+        if (scanAt !== null) {
+          if (scanAt > pane.scrollHeight) { done(false); return }
+          pane.scrollTop = scanAt
+          scanAt += Math.max(60, Math.round((pane.clientHeight || 240) * 0.8))
+          locateAfter(step, 80)
+          return
+        }
+        // ② 还没载入到这一轮 —— 载（先跳转加载器，再一次一页地点）
+        if (!trajTurnLoaded(content, n)) {
+          if (!jumped && jumpThrough()) return
+          if (pageEarlier()) { locateAfter(step, 60); return }
+          // 按钮点不动（多半是正在载）→ 等一拍；按钮真没了 → 没得载了，放手
+          if (trajHasEarlier(pane)) { locateAfter(step, 120); return }
+          done(false)
+          return
+        }
+        // ③ 载入了，但没渲染出来 —— 在已载入窗口里滚动找
+        var seen = trajRenderedTurns(pane)
+        var top = pane.scrollTop
+        /*
+         * 视野里**一条轮次边界都没有** —— 整段都落在某一轮内部（实测第 1 轮 179 步、
+         * 三百多行）。这时判不了方向，只能往窗口头走：窗口首行永远带轮次标记。
+         */
+        if (seen.min === null) {
+          if (top <= 2) { giveUpOrScan(); return }
+          goTop()
+          return
+        }
+        if (seen.max !== null && seen.max < n) {
+          // 目标在**更晚**处：往下二分
+          if (hi - top <= 2) { giveUpOrScan(); return }
+          lo = top
+          pane.scrollTop = Math.round(top + (hi - top) / 2)
+          locateAfter(step, 90)
+          return
+        }
+        if (seen.min > n) {
+          // 目标在**更早**处：直接顶到窗口头（那里才有轮次标记，二分只是白挪）
+          if (top > 2) { goTop(); return }
+          // 已经在窗口头，头那一轮还比目标晚 —— 要么是 `trajTurnLoaded` 看走眼了
+          // （时间轴那枚边界是上一次渲染的），要么宿主没跟上。给它三次机会，然后放手。
+          stuck += 1
+          if (stuck > 3) { giveUpOrScan(); return }
+          locateAfter(step, 150)
+          return
+        }
+        stuck = 0
+        /*
+         * n 落在渲染区间里，却既取不到用户消息行、有时连**边界行**也取不到。
+         *
+         * 两种收场，区别在"这一轮的边界行在不在渲染出来的行里"：
+         *   · 在 —— 那就是**窗口头截断**（窗口从这一轮中间开始的产物）或者这一轮本来就没有
+         *     用户消息行：还有更早的历史就继续载，载不动了就**尽力落在它的边界行上**。
+         *   · 不在 —— 幻影一样的情况：区间跨过了它、可虚拟滚动挂出来的那几十行里没有它。
+         *     宿主没有跳转能力、表又是按轮次递增排的，**不猜、也不空转** —— 放手。
+         */
+        var boundary = trajTurnRow(pane, n)
+        if (boundary !== null) {
+          if (trajHasEarlier(pane)) {
+            if (pageEarlier()) { locateAfter(step, 60); return }
+            locateAfter(step, 120)
+            return
+          }
+          // 步的目标**不许**把"落在这一轮上"当找到（用户要的是那一步）：
+          // 走到这儿说明这一轮的助手行一条都没挂出来，去 ①' 那条路也没路标 —— 兜底扫描。
+          if (wantKey !== null) { giveUpOrScan(); return }
+          land()
+          return
+        }
+        giveUpOrScan()
+      }
+      step()
+    }
+
+    /**
+     * 点轮次号的总入口：按主会话当前所在的页面分派。
+     *
+     * ⚠️ 一进来就 `locateStop()`：连点两下（或点了这一轮又点那一轮）时，前一次的动作必须
+     *    作废 —— 否则两个动作会一起写滚动位置，落点是"最后写的那一个"，看着像乱跳。
+     * @param sessionId - 当前会话（翻历史要用）。
+     * @param n - 轮号。
+     * @param seq - 这一轮 `turn/start` 的事件序号（骨架里有）；给了就能用宿主的
+     *              `loadThrough(seq)` 一次翻到位，缺了就退回"一页一页翻"。
+     * @returns 是否真的开始定位（false = 主会话不在对话/轨迹页，什么都没做）。
+     */
+    function locateMainTurn(sessionId, n, seq) {
+      locateStop()
+      var turn = Number(n)
+      if (!Number.isFinite(turn) || turn <= 0) return false
+      var content = mainContent()
+      var view = mainViewOf(content)
+      var at = Number(seq)
+      var jumpSeq = Number.isFinite(at) && at >= 0 ? at : undefined
+      if (view === 'chat') { locateInChat(sessionId, content, turn, function () {}); return true }
+      if (view === 'trajectory') { locateInTrajectory(sessionId, content, turn, null, jumpSeq, function () {}); return true }
+      return false
+    }
+
+    /**
+     * **某一步**的总入口：主会话在轨迹页时，跳到那一步并**选中它**。
+     *
+     * 为什么只做轨迹页：`步骤`是"一次模型往返"，只有轨迹页把它当**一条记录**摆出来
+     * （行身份就是 `assistant\0<轮>\0<步>`，见 {@link trajStepOf}）。对话页那边每一步
+     * 都在**折叠住的**过程块里，没有可寻址的锚点 —— 硬做只能在界面上凭空找位置，
+     * 不如老实不做。
+     *
+     * @param sessionId - 当前会话（翻历史要用）。
+     * @param n - 轮号。
+     * @param step - 这一轮里的第几步（1 起）。
+     * @param seq - 这一轮 `turn/start` 的事件序号（骨架里有）；没有就退回"一页一页翻"。
+     * @returns 是否真的开始定位（false = 主会话不在轨迹页，什么都没做）。
+     */
+    function locateMainStep(sessionId, n, step, seq) {
+      locateStop()
+      var turn = Number(n)
+      var s0 = Number(step)
+      if (!Number.isFinite(turn) || turn <= 0 || !Number.isFinite(s0) || s0 <= 0) return false
+      var content = mainContent()
+      if (mainViewOf(content) !== 'trajectory') return false
+      var at = Number(seq)
+      var jumpSeq = Number.isFinite(at) && at >= 0 ? at : undefined
+      locateInTrajectory(sessionId, content, turn, s0, jumpSeq, function () {})
+      return true
+    }
+
+    // ────────────────────────── 样式的一生（一份 + 引用计数） ──────────────────────────
+    //
+    // 这里踩过一个"看着像样式丢了"的坑，值得写清楚（2026-09-28 真机截图）：
+    //
+    // 原来的写法是每次 apply「先摘掉同 id 的旧元素，再挂一个新的」，dispose 时
+    // `style.remove()`。单代实例下没问题 —— 可**同一页面里经常同时存在两代实例**：
+    // 热重载是"新实例先 apply、旧实例稍后 dispose"，中间那段时间两代都在。
+    // 于是谁 dispose 谁摘掉**文档里那一个**，而那个元素是**最后 apply 的实例**挂的：
+    // 幸存实例就变成"有 DOM、没样式"——整块面板退回浏览器默认样式：
+    // 按钮带边框与灰底（`#N`、`▸` 都变成小方块）、分组块没有底色、
+    // 容量条整条消失、`.tf-phase-meta` 不再被 `margin-left:auto` 推到行尾。
+    // 用户截图里就是这一套（而他看到的"问题"就是它）。
+    //
+    // 所以改成：**全页面只维护一个样式元素 + 引用计数**（计数挂在 window 上，跨模块实例共享）。
+    //   · apply / 面板挂载 → `injectCss()`：元素在就**改写内容**（永远最新一份赢），不在就补挂；
+    //   · dispose / 面板卸载 → `releaseCss()`：计数归零才真的摘掉；
+    //   · 面板在屏幕上时周期性 `ensureCss()`：元素被别处摘掉也能自愈。
+
+    /** 样式元素的 id：全页面唯一，跨代实例靠它认出同一个元素。 */
+    var CSS_ID = 'dsh-think-flow-css'
+
+    /**
+     * 引用计数器（挂在 window 上）。
+     *
+     * ⚠️ **不能**放模块级：bundle 被重新求值后是新模块作用域，旧实例 dispose 时
+     * 得和新实例对话 —— 两代之间只有 window 是共享的。
+     * @returns 计数器对象。
+     */
+    function cssRef() {
+      var w = window
+      var ref = w.__dshThinkFlowCss
+      if (!ref || typeof ref !== 'object') { ref = { count: 0 }; w.__dshThinkFlowCss = ref }
+      return ref
+    }
+
+    /** 文档里那一个样式元素（不在文档里返回 null）。 */
+    function cssElInDoc() {
+      if (typeof document === 'undefined' || typeof document.getElementById !== 'function') return null
+      return document.getElementById(CSS_ID) || null
+    }
+
+    /**
+     * 取一份样式引用：保证文档里有这个元素、内容是当前 CSS，计数 +1。
+     * @returns 这个样式元素（dispose 时交回 {@link releaseCss}）。
+     */
+    function injectCss() {
+      var ref = cssRef()
+      var style = cssElInDoc()
+      if (style === null) {
+        style = el('style')
+        style.id = CSS_ID
+        document.head.appendChild(style)
+      }
+      // 后 apply 的实例就是**当前在跑的那份代码**，所以永远让它赢（改写，不另挂一个）
+      style.textContent = CSS
+      ref.count += 1
+      return style
+    }
+
+    /**
+     * 交回一份样式引用：只有最后一个用的人真的摘掉。
+     * @param style - {@link injectCss} 返回的那个元素。
+     */
+    function releaseCss(style) {
+      var ref = cssRef()
+      ref.count = Math.max(0, ref.count - 1)
+      if (ref.count > 0) return
+      // 只摘自己挂的那个；它可能早被新一代接管（那它已在文档外，摘是空操作）
+      if (style && typeof style.remove === 'function') style.remove()
+      else if (style && style.parentNode && typeof style.parentNode.removeChild === 'function') style.parentNode.removeChild(style)
+    }
+
+    /** 自愈：元素不在文档里就补挂（**不计引用** —— 补挂的还是当前这份 CSS）。 */
+    function ensureCss() {
+      if (cssElInDoc() !== null) return
+      var style = el('style')
+      style.id = CSS_ID
+      style.textContent = CSS
+      document.head.appendChild(style)
+    }
+
     // ────────────────────────────── 挂载 ──────────────────────────────
 
     function apply(ctx) {
@@ -3685,6 +4839,12 @@ window.__ModuleLoader__.load({
       var probe = (window.__dshThinkFlow = window.__dshThinkFlow || {})
       probe.applied = true
       probe.internals = exports.__internals
+      /**
+       * 定位（点轮次号 → 主会话跳过去）要用宿主会话控制器翻历史，所以把 ctx 记下来 ——
+       * 点击回调在组件里，拿不到 apply 的参数。
+       */
+      ctxRef = ctx
+      ctx.effect(function () { return function () { locateStop() } }, 'dsh-think-flow: locate timers')
       /** 头部入口的注册事实：控制台可核对（order 越小越靠左）。 */
       probe.headerEntry = { id: 'dsh-think-flow:open', order: 9, icon: 'spine+steps' }
       probe.open = function () {
@@ -3693,17 +4853,9 @@ window.__ModuleLoader__.load({
         return false
       }
 
-      // 样式注入。
-      // ⚠️ 不能写 `if (!getElementById(...))` —— 热重载时若旧实例还没 dispose，
-      // 守卫会成立、新 CSS **永远注入不进去**，表现就是"改了样式却没变化"（本轮踩到）。
-      // 所以无条件替换：先摘掉同 id 的旧元素，再挂新的。
-      var previous = document.getElementById('dsh-think-flow-css')
-      if (previous && previous.remove) previous.remove()
-      var style = el('style')
-      style.id = 'dsh-think-flow-css'
-      style.textContent = CSS
-      document.head.appendChild(style)
-      ctx.effect(function () { return function () { style.remove() } }, 'dsh-think-flow: css')
+      // 样式注入（一份 + 引用计数，见上面「样式的一生」那段 —— 这里踩过真机的坑）
+      var cssHold = injectCss()
+      ctx.effect(function () { return function () { releaseCss(cssHold) } }, 'dsh-think-flow: css')
 
       if (!ctx.slots || typeof ctx.slots.inject !== 'function') {
         probe.error = 'ctx.slots 不可用'
@@ -3811,14 +4963,30 @@ window.__ModuleLoader__.load({
       fmtDur: fmtDur,
       /** 时长那条公式（纯函数）：活跃步按 `now` 涨、结束的步定格。测试直接喂 now 验。 */
       stepDurMs: stepDurMs,
-      /** 无工具步的名字：正文摘要 / 「无输出」/ 不填（纯函数，测试直接喂文本验）。 */
+      /** 无工具步的名字：正文摘要 / 没有正文时给空串（行里改画「思考」或那三个点）。纯函数，测试直接喂文本验。 */
       excerptOf: excerptOf,
       cleanProse: cleanProse,
       stepOwnTitle: stepOwnTitle,
+      /** 只有思考、还没正文时行里那句（用户定的）。 */
+      THINK_TITLE: THINK_TITLE,
+      /** 什么都没有时行里那三个点用的字符（`·` 在中线上；`…` 落在基线上，太低）。 */
+      DOT: DOT,
+      /** 有没有收到过思考（行里"画「思考」还是画三个点"就按它分）。 */
+      stepHasThinking: stepHasThinking,
+      /** 没有标题时的悬停说明（0/0/0 与"只有思考"在这里分开）。 */
+      noTitleNote: noTitleNote,
       TAB_ID: TAB_ID,
       TAB_KIND: TAB_KIND,
       PHASE_GAP_MS: PHASE_GAP_MS,
       CSS: CSS,
+      /**
+       * 样式的一生（**给测试用**）：见上面「样式的一生」那段。
+       * 真机上只有 apply / 面板挂载 / 500ms 自愈三处会碰它们。
+       */
+      injectCss: injectCss,
+      releaseCss: releaseCss,
+      ensureCss: ensureCss,
+      CSS_ID: CSS_ID,
       /**
        * 清掉模块级视图状态（**只给测试用**）。
        *
@@ -3836,6 +5004,27 @@ window.__ModuleLoader__.load({
       viewStateOf: viewStateOf,
       isPinned: isPinned,
       shouldFollow: shouldFollow,
+      /**
+       * 主会话定位（点轮次号 → 跳到那一轮）。
+       *
+       * 这一组是**真的碰宿主 DOM** 的代码，而真机上它出问题的表现是"点了没反应"——
+       * 所以拆开暴露：判定（视图/刻度/轨迹行）都是纯读 DOM 的函数，测试喂桩 DOM 直接验；
+       * `locateMainTurn` 是总入口，端到端用例喂一棵假的主会话 DOM 走完整条路。
+       */
+      locateMainTurn: locateMainTurn,
+      locateMainStep: locateMainStep,
+      locateStop: locateStop,
+      trajStepKey: trajStepKey,
+      trajStepOf: trajStepOf,
+      trajRowByKey: trajRowByKey,
+      mainContent: mainContent,
+      mainViewOf: mainViewOf,
+      chatTurnRow: chatTurnRow,
+      railMarkOf: railMarkOf,
+      turnOfMark: turnOfMark,
+      trajTurnRow: trajTurnRow,
+      trajRenderedTurns: trajRenderedTurns,
+      locateInTrajectory: locateInTrajectory,
     }
     return module.exports
   },

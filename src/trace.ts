@@ -62,8 +62,8 @@ export interface ToolFact {
   readonly note?: string
   readonly startedAt: number
   endedAt?: number
-  /** 结果字符数，用来判断"查回来了多少"。 */
-  resultChars?: number
+  /** 结果的 **Token 估算数**（{@link countTokens} 口径），用来判断"查回来了多少"。 */
+  resultTokens?: number
   /**
    * 失败了才有。**没有这个字段 = 成功**（而不是"未知"）—— 宿主对每一次调用都会写一条
    * `tool/result`，带上 `isError`，所以"没标失败"是有依据的成功。
@@ -86,6 +86,55 @@ export interface ToolFact {
  */
 export const ERROR_TEXT_CHARS = 200
 
+/**
+ * 一个英文字符折算多少 Token。
+ *
+ * 口径来自 DeepSeek 官方给的经验密度：**1 个英文字符 ≈ 0.3 Token、
+ * 1 个中文字符 ≈ 0.6 Token**。宿主自己的 `dsh-token-meter` 用的是"4 字符 = 1 Token"
+ * （面向英文的固定密度），对中文会**低估一半以上** —— 这个面板读的思考是英文 CoT、
+ * 正文常常是中文，两边混在一起，所以按字符宽度分档更接近真相。
+ *
+ * ⚠️ 这是**估算**：真正的 Token 数只有 provider 的 `usage.outputTokens` 才有，
+ *    而它只给"整个 step 的产出"（思考 + 正文 + 工具参数），拿它当"这一步想了多少"
+ *    会连工具参数一起算进去 —— 而且它在一次尝试**结束时**才到，面板上那根会长的
+ *    容量条就再也长不起来了。所以这里统一走密度估算：口径只有一个，实时和历史一致。
+ */
+const ASCII_TOKENS_PER_CHAR = 0.3
+
+/** 一个非 ASCII 字符（中文/日文/全角标点…）折算多少 Token。见 {@link ASCII_TOKENS_PER_CHAR}。 */
+const WIDE_TOKENS_PER_CHAR = 0.6
+
+/**
+ * 一段文本的 **Token 权重**（**不取整**）。
+ *
+ * 为什么要小数：增量是按 chunk 累加的，若每个 chunk 都先四舍五入再相加，
+ * 一个 7000 字符的思考会被上千个 chunk 的取整误差顶出几十上百个 Token 的偏差。
+ * 累加权重、对外只取一次整，和"整段文本直接算"结果一致。
+ * @param text - 任意文本。
+ * @returns 权重（0 = 空串）。
+ */
+export function tokenWeight(text: string): number {
+  let weight = 0
+  for (const ch of text) {
+    weight += ((ch.codePointAt(0) ?? 0) < 0x80 ? ASCII_TOKENS_PER_CHAR : WIDE_TOKENS_PER_CHAR)
+  }
+  return weight
+}
+
+/**
+ * 权重 → 对外报的整数 Token 数。
+ * @param weight - {@link tokenWeight} 的累加值。
+ * @returns 取整后的 Token 数：**非空文本至少 1**（"只吐了一个字"不该显示 0）。
+ */
+export function roundTokens(weight: number): number {
+  return weight <= 0 ? 0 : Math.max(1, Math.round(weight))
+}
+
+/** 一段文本估算出来的 Token 数（{@link tokenWeight} + {@link roundTokens}）。 */
+export function countTokens(text: string): number {
+  return roundTokens(tokenWeight(text))
+}
+
 /** 一个 step 的事实。字段存事实，状态由 {@link stepStatus} 推导。 */
 export interface StepFact {
   readonly turn: number
@@ -96,6 +145,15 @@ export interface StepFact {
   reasoning: string
   /** 这一步的正文（通常是调用工具前的过渡语，或最终回答）。 */
   text: string
+  /**
+   * 思考原文的 **Token 权重累计**（小数，见 {@link tokenWeight}）。
+   *
+   * 存权重而不是存整数：增量是一个 chunk 一个 chunk 加上来的，
+   * 每个 chunk 分别取整会累积误差。对外只经 {@link reasoningTokensOf} 取一次整。
+   */
+  reasoningWeight: number
+  /** 正文的 Token 权重累计。 */
+  textWeight: number
   readonly tools: ToolFact[]
   /** 首次收到 attempted 流的时间。 */
   startedAt: number
@@ -117,6 +175,14 @@ export interface StepFact {
 export interface TurnFact {
   readonly turn: number
   startedAt: number
+  /**
+   * **这一轮 `turn/start` 事件的序号**（落盘日志里的 `seq`）。
+   *
+   * 用途只有一个：主会话的"跳到某一轮"（面板里点轮次号）要靠 `session.loadThrough(seq)`
+   * 把历史翻到这一轮 —— 宿主自己的「轮次导航」用的就是这个值。缺失（老日志、事件被
+   * hydrate 上限截掉）时客户端退回到"一页一页翻"那条慢路。
+   */
+  seq?: number
   endedAt?: number
   /** 中断/出错的收尾原因（turn/end 的 reason）。 */
   endReason?: string
@@ -146,7 +212,7 @@ export interface SessionTrace {
    * **必须有这张表**：宿主的流式帧里只有 `start` 带 `turn`/`step`，
    * `chunk` 只带 `attemptId`/`index`/`chunk`（见 dsh-agent-loop 的
    * AssistantStreamAttempt.start/push）。早先版本在 chunk 分支里直接读
-   * `frame.turn`，读不到就丢弃 —— 结果是收到三万个帧、思考仍然是 0 字（真机踩过）。
+   * `frame.turn`，读不到就丢弃 —— 结果是收到三万个帧、思考仍然是 0 Token（真机踩过）。
    */
   readonly attempts: Map<string, { turn: number; step: number }>
   /** 内部：这个会话最近被触碰到的 (turn, step)，用于插件中途加载时的归属回退。 */
@@ -227,12 +293,30 @@ function stepOf(trace: SessionTrace, turn: number, step: number, now: number): S
   const t = turnOf(trace, turn, now)
   let s = t.steps.find((x) => x.step === step)
   if (s === undefined) {
-    s = { turn, step, attempts: 0, reasoning: '', text: '', tools: [], startedAt: now, chunkCount: 0 }
+    s = { turn, step, attempts: 0, reasoning: '', text: '', reasoningWeight: 0, textWeight: 0, tools: [], startedAt: now, chunkCount: 0 }
     t.steps.push(s)
     t.steps.sort((a, b) => a.step - b.step)
   }
   trace.lastStep = { turn, step }
   return s
+}
+
+/**
+ * 这一步的思考 Token 数（对外报的那个整数）。
+ * @param step - 这一步的事实。
+ * @returns 取整后的 Token 数；没有思考时 0。
+ */
+export function reasoningTokensOf(step: StepFact): number {
+  return roundTokens(step.reasoningWeight)
+}
+
+/**
+ * 这一步的正文 Token 数（对外报的那个整数）。
+ * @param step - 这一步的事实。
+ * @returns 取整后的 Token 数；没有正文时 0。
+ */
+export function textTokensOf(step: StepFact): number {
+  return roundTokens(step.textWeight)
 }
 
 /** 该 turn 里最后一步（界面上的"当前步"）。 */
@@ -315,12 +399,16 @@ export interface StepTiming {
  * 状态只能有一个来源：宿主按事实推导出来的这个值。
  *
  * 同理，每一种都带上 `timing`（时间事实）—— 时长也只能有一个来源：事实。
+ *
+ * 同理，`reasoning` / `text` 增量带上 `tokens`（这一步**累计**的 Token 数，不是本段的）——
+ * Token 也只有一个来源：宿主按 {@link tokenWeight} 算的累计值。客户端照抄、
+ * **不做第二次取整**，否则两端各算一遍必然漂。
  */
 export type TraceChange =
-  | { k: 'reasoning'; turn: number; step: number; text: string; status: StepStatus; timing: StepTiming }
-  | { k: 'text'; turn: number; step: number; text: string; status: StepStatus; timing: StepTiming }
+  | { k: 'reasoning'; turn: number; step: number; text: string; tokens: number; status: StepStatus; timing: StepTiming }
+  | { k: 'text'; turn: number; step: number; text: string; tokens: number; status: StepStatus; timing: StepTiming }
   | { k: 'tool'; turn: number; step: number; tool: ToolFact; status: StepStatus; timing: StepTiming }
-  | { k: 'tool-end'; turn: number; step: number; id: string; endedAt: number; resultChars: number; failed?: ToolFailure; status: StepStatus; timing: StepTiming }
+  | { k: 'tool-end'; turn: number; step: number; id: string; endedAt: number; resultTokens: number; failed?: ToolFailure; status: StepStatus; timing: StepTiming }
   | { k: 'step'; turn: number; step: number; status: StepStatus; timing: StepTiming }
   | { k: 'gap'; turn: number; step: number; status: StepStatus; timing: StepTiming }
   | { k: 'turn'; turn: number; endedAt?: number; interrupted?: boolean; endReason?: string; userText?: string }
@@ -473,7 +561,7 @@ export function applyStreamFrame(trace: SessionTrace, frame: StreamFrame, now: n
   if (s.attemptId === undefined) {
     // 插件是在本轮中途加载的：start 帧早就过去了，只收到了 chunk。
     // 这时必须**认领**这个 attemptId，否则每一步的思考都会被"尝试不匹配"挡掉，
-    // 表现就是工具调用有、思考正文永远是 0 字（真实踩过）。
+    // 表现就是工具调用有、思考正文永远是 0 Token（真实踩过）。
     s.attemptId = attemptId
     s.nextIndex = index
   } else if (s.attemptId !== attemptId) {
@@ -497,12 +585,14 @@ export function applyStreamFrame(trace: SessionTrace, frame: StreamFrame, now: n
   const timing = timingOf(s)
   if (ctype === 'reasoning-delta') {
     s.reasoning += text
+    s.reasoningWeight += tokenWeight(text)
     s.chunkCount += 1
-    out.push({ k: 'reasoning', turn, step, text, status, timing })
+    out.push({ k: 'reasoning', turn, step, text, tokens: reasoningTokensOf(s), status, timing })
   } else if (ctype === 'text-delta') {
     s.text += text
+    s.textWeight += tokenWeight(text)
     s.chunkCount += 1
-    out.push({ k: 'text', turn, step, text, status, timing })
+    out.push({ k: 'text', turn, step, text, tokens: textTokensOf(s), status, timing })
   }
   if (out.length) trace.updatedAt = now
   return out
@@ -512,6 +602,8 @@ export function applyStreamFrame(trace: SessionTrace, frame: StreamFrame, now: n
 export interface SessionEventLike {
   type?: unknown
   time?: unknown
+  /** 落盘日志里的**事件序号**（`turn/start` 上那个值就是"跳轮"的锚点）。 */
+  seq?: unknown
   data?: unknown
 }
 
@@ -538,23 +630,23 @@ function extractBlocks(content: unknown): { reasoning: string; text: string } {
 }
 
 /**
- * 从 tool/result 的 message 里数出**文本**字符数。
+ * 从 tool/result 的 message 里数出**文本 Token 数**（{@link countTokens} 口径）。
  *
  * 只数 `text` 字段，不数任意字符串 —— 否则 `tool-result`、`text` 这些类型名
  * 也会被算进去（实测：一段 6 字的结果被算成 21 字）。
  */
-function resultChars(message: unknown): number {
+function resultTokens(message: unknown): number {
   const content = (message as { content?: unknown } | undefined)?.content
-  let n = 0
+  let weight = 0
   const walk = (v: unknown): void => {
     if (Array.isArray(v)) { v.forEach(walk); return }
     if (!v || typeof v !== 'object') return
     const o = v as Record<string, unknown>
-    if (typeof o['text'] === 'string') n += o['text'].length
+    if (typeof o['text'] === 'string') weight += tokenWeight(o['text'])
     for (const k of Object.keys(o)) if (k !== 'text') walk(o[k])
   }
   walk(content)
-  return n
+  return roundTokens(weight)
 }
 
 /**
@@ -652,6 +744,10 @@ export function applySessionEvent(trace: SessionTrace, event: SessionEventLike, 
   if (type === 'turn/start') {
     const t = turnOf(trace, turn, at)
     t.startedAt = Math.min(t.startedAt, at)
+    // 事件序号是"跳轮"的锚点（宿主 loadThrough 要它）。**覆盖**而不是取最小：
+    // 同号事件重放时以最新一条为准，和别的事实一致。
+    const seq = finite(event.seq)
+    if (seq !== undefined) t.seq = seq
     trace.updatedAt = now
     return [{ k: 'turn', turn, interrupted: t.interrupted === true }]
   }
@@ -687,8 +783,15 @@ export function applySessionEvent(trace: SessionTrace, event: SessionEventLike, 
     // **覆盖**而不是追加：同一步重试时会有多条 assistant/message，
     // 流式路径把两次尝试拼在了一起，而落盘只留最终那条 —— 以它为准更正确。
     // 覆盖后缺口标记也不再有意义（内容已经是权威版本）。
-    if (reasoning !== '') { s.reasoning = reasoning; s.streamGap = false }
-    if (text !== '') s.text = text
+    if (reasoning !== '') {
+      s.reasoning = reasoning
+      s.reasoningWeight = tokenWeight(reasoning)
+      s.streamGap = false
+    }
+    if (text !== '') {
+      s.text = text
+      s.textWeight = tokenWeight(text)
+    }
     trace.updatedAt = now
     return [{ k: 'step', turn, step, status: stepStatus(s, turnFor(trace, turn)), timing: timingOf(s) }]
   }
@@ -704,9 +807,9 @@ export function applySessionEvent(trace: SessionTrace, event: SessionEventLike, 
    *    35/34ms…），而这些步在 `step/start → assistant/message` 之间明明想了
    *    2.6s / 7.4s / 9.7s / 19.8s。
    *
-   *    表现就是面板上刺眼的「长条 + 0.1s」：容量条编码的是**思考字数**（那个是真的），
-   *    旁边的数字却只数了工具 —— 一个"想了 3.7k 字、工具跑了 0.1s"的步，看起来就像
-   *    "0.1 秒想了 3.7k 字"。更要命的是**同一屏两种口径**：收到过实时流帧的步
+   *    表现就是面板上刺眼的「长条 + 0.1s」：容量条编码的是**思考 Token**（那个是真的），
+   *    旁边的数字却只数了工具 —— 一个"想了 3.7k Token、工具跑了 0.1s"的步，看起来就像
+   *    "0.1 秒想了 3.7k Token"。更要命的是**同一屏两种口径**：收到过实时流帧的步
    *    （`applyStreamFrame` 的 start 会把起点置成真实时刻）时长含思考，回放/漏帧的步
    *    不含 —— 同一个会话里 24s 的步和 0.1s 的步可能干了同样多的事。
    *
@@ -768,21 +871,21 @@ export function applySessionEvent(trace: SessionTrace, event: SessionEventLike, 
     const tool = callId !== undefined ? s.tools.find((t) => t.id === callId) : s.tools.find((t) => t.endedAt === undefined)
     if (tool === undefined) return []
     tool.endedAt = at
-    tool.resultChars = resultChars(message)
+    tool.resultTokens = resultTokens(message)
     /**
      * 失败态**必须在这里落地**（而不是留给客户端从正文认 "Error: " 前缀）。
      *
      * 判据是宿主的 `message.isError` —— 它是 `toolErrorResult` 写死的布尔，
      * 恰好严格为 `true` 才算（脏数据里出现过字符串 `'true'` 之类，不能迁就）。
      *
-     * 这一步**从前是漏的**：只记了 `endedAt` 和 `resultChars`，于是面板上
+     * 这一步**从前是漏的**：只记了 `endedAt` 和结果长度，于是面板上
      * 失败的调用和成功的长得一模一样 —— 而它恰恰是用户最需要看见的一类事件
      * （"为什么卡住了 / 这一步白跑了吗"）。
      */
     if (message?.isError === true) tool.failed = failureOf(message, data['error'])
     trace.updatedAt = now
     return [{
-      k: 'tool-end', turn, step, id: tool.id, endedAt: at, resultChars: tool.resultChars,
+      k: 'tool-end', turn, step, id: tool.id, endedAt: at, resultTokens: tool.resultTokens,
       ...(tool.failed !== undefined ? { failed: tool.failed } : {}),
       status: stepStatus(s, turnFor(trace, turn)),
       timing: timingOf(s),

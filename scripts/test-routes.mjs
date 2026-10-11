@@ -229,7 +229,8 @@ console.log('\n③ /trace')
   const snap = res2.json()
   ok('known:true 且有一个 turn', snap.known === true && snap.turns.length === 1)
   ok('两步都在', snap.turns[0].steps.length === 2)
-  ok('思考字数被统计（不是 0）', snap.turns[0].steps[0].reasoningChars === 11, snap.turns[0].steps[0].reasoningChars)
+  // 'hello world' = 11 个 ASCII 字符 × 0.3 = 3.3 → 取整 3
+  ok('思考 Token 被统计（不是 0）', snap.turns[0].steps[0].reasoningTokens === 3, snap.turns[0].steps[0].reasoningTokens)
   ok('工具调用被记录', snap.turns[0].steps[0].tools.length === 1)
   ok('只有"当前步"带原文尾部（其余按需取）', snap.turns[0].steps[0].reasoningTail === undefined && typeof snap.turns[0].steps[1].reasoningTail === 'string')
   ok('快照带 serverTime', typeof snap.serverTime === 'number')
@@ -247,6 +248,16 @@ console.log('\n③ /trace')
   ok('有正文的步带上 textHead（就是正文开头）',
     snap2.turns[0].steps[0].textHead === '已经改好了，测试也过了。后面还有一段。', snap2.turns[0].steps[0].textHead)
   ok('textHead 只给开头那一段（有上限）', snap2.turns[0].steps[0].textHead.length <= 160)
+
+  // 跳轮锚点：`turn/start` 的 seq 必须随**骨架**（index）下发 —— 客户端点轮次号时
+  // 拿它调宿主的 `session.loadThrough(seq)`；只在正文快照里给是不够的（能跳的轮次
+  // 恰恰常常是正文还没取回来的那些）。
+  app.emit('session/event', { id: 's1' }, { type: 'turn/start', seq: 77, time: T0 + 20, data: { turn: 1 } })
+  const res3 = fakeRes()
+  await app.handler(`${API}/trace`)(fakeReq(`${API}/trace?session=s1`), res3)
+  const snap3 = res3.json()
+  const idx1 = (snap3.index || []).find((x) => x.turn === 1)
+  ok('骨架里带这一轮 turn/start 的 seq（客户端"跳到某一轮"用）', idx1 !== undefined && idx1.seq === 77, idx1 && idx1.seq)
 }
 
 // ───────────────────── ④ /step 按需取原文 ─────────────────────
@@ -379,7 +390,8 @@ console.log('\n⑨ 单步原文上限（从尾部保留，并如实标记）')
   const res = fakeRes()
   await app.handler(`${API}/trace`)(fakeReq(`${API}/trace?session=s1`), res)
   const step = res.json().turns[0].steps[0]
-  ok('字数被限制在上限附近', step.reasoningChars <= 1200, step.reasoningChars)
+  // 截断保留尾部 1000 个 ASCII 字符 → 1000 × 0.3 = 300 Token（Token 数按**留下**的正文重算）
+  ok('Token 数按截断后的原文重算（1000 字符 → 300 Token）', step.reasoningTokens === 300, step.reasoningTokens)
   ok('截断过就标记 streamGap（不假装完整）', step.streamGap === true)
 }
 
@@ -803,8 +815,9 @@ console.log('\n⑬ /trace 历史回看（内存里空 → 从落盘折）')
   const snap = res.json()
   ok('回看后 known:true', snap.known === true)
   ok('折出了两个 turn', snap.turns.length === 2, snap.turns.length)
-  ok('思考原文从落盘读出来了', snap.turns[0].steps[0].reasoningChars === '从落盘读出来的思考'.length,
-    snap.turns[0].steps[0].reasoningChars)
+  // '从落盘读出来的思考' = 9 个非 ASCII 字符 × 0.6 = 5.4 → 取整 5
+  ok('思考原文从落盘读出来了', snap.turns[0].steps[0].reasoningTokens === 5,
+    snap.turns[0].steps[0].reasoningTokens)
   ok('工具调用也折出来了', snap.turns[0].steps[0].tools.length === 1)
   /**
    * 失败态在**历史回看**这条路上也要有 —— 面板最常被打开的场合恰恰是"回头看这一轮
@@ -851,8 +864,9 @@ console.log('\n⑭ 历史回看失败要静默降级')
   const res = fakeRes()
   await app.handler(`${API}/trace`)(fakeReq(`${API}/trace?session=s1`), res)
   const snap = res.json()
-  ok('读盘失败时实时数据照常返回', snap.turns.length === 1 && snap.turns[0].steps[0].reasoningChars === 13,
-    snap.turns[0] && snap.turns[0].steps[0].reasoningChars)
+  // 'live thinking' = 13 个 ASCII 字符 × 0.3 = 3.9 → 取整 4
+  ok('读盘失败时实时数据照常返回', snap.turns.length === 1 && snap.turns[0].steps[0].reasoningTokens === 4,
+    snap.turns[0] && snap.turns[0].steps[0].reasoningTokens)
 }
 
 
@@ -1049,8 +1063,9 @@ console.log('\n⑳ 全轮目录 / 按需取轮 / 搜索')
   ok('骨架标了"不在内存里"', s1 && s1.inMemory === false, s1 && s1.inMemory)
   ok('窗口里的轮标了"在内存里"',
     snap.index.find((x) => x.turn === 5).inMemory === true)
-  ok('骨架里没有正文（只有字数）',
-    s1 && s1.reasoningChars === '第1轮的思考'.length && s1.reasoning === undefined, s1)
+  // '第1轮的思考' = 5 个非 ASCII 字符 × 0.6 + 1 个 ASCII 字符 × 0.3 = 3.3 → 取整 3
+  ok('骨架里没有正文（只有 Token 数）',
+    s1 && s1.reasoningTokens === 3 && s1.reasoning === undefined, s1)
 
   // /turn：把第 1 轮折回来
   const before = reads.open
@@ -1059,7 +1074,7 @@ console.log('\n⑳ 全轮目录 / 按需取轮 / 搜索')
   const t1b = t1.json()
   ok('/turn 取回第 1 轮', t1b.ok === true && t1b.turn.turn === 1, t1b.turn && t1b.turn.turn)
   ok('/turn 返回的形状和快照里的一致（客户端能直接塞进去）',
-    t1b.turn.steps[0].reasoningChars === '第1轮的思考'.length && t1b.turn.userText === '第1轮要什么', t1b.turn.steps[0])
+    t1b.turn.steps[0].reasoningTokens === 3 && t1b.turn.userText === '第1轮要什么', t1b.turn.steps[0])
   ok('/turn 真的又读了一次盘（那一轮不在内存里）', reads.open > before, [before, reads.open])
 
   const again = fakeRes()
@@ -1133,6 +1148,91 @@ console.log('\n㉑ 工具失败：快照与增量都要带上（宿主说了失�
   ok('SSE 的 tool-end 带权威状态', end && end.status !== undefined, end && end.status)
   ok('SSE 的 tool-end 带上失败（实时不等快照）', end && end.failed && end.failed.code === 'TOOL_TIMEOUT', end && end.failed)
   req.close()
+}
+
+
+// ───────── ㊿ 过期自愈：并发折历史只能折一趟 + "看着还在跑"要重折日志 ─────────
+//
+// 用户："第二轮已经中断了，怎么还在运行"。两个真原因都在这一节里：
+//   ① 两个面板同时连上来会**并发**折历史 —— 后一次把前一次的排队表覆盖掉，
+//      中间到的实时事件（轮结束）再也没人补放，内存里那份永远停在"还在跑"，
+//      **刷新页面也好不了**（`hydrated` 早退了）。
+//   ② 本进程**不是**这个会话的驱动者时（换个客户端接着看），实时事件根本不会来 ——
+//      打开面板那一刻折出来的"还在跑"没人更正。所以沉默够久就重折一遍日志。
+console.log('\n㊿ 过期自愈（单飞折历史 + 沉默够久重折日志）')
+{
+  // ① 单飞
+  let reads = 0
+  let release = null
+  const gate = new Promise((r) => { release = r })
+  const openLog = [
+    { type: 'turn/start', time: T0, data: { turn: 1 } },
+    { type: 'assistant/message', time: T0 + 10, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'reasoning', text: 'thinking…' }] } } },
+    ...toolCall(1, 1, 'call_slow', 'bash'),
+  ]
+  const app = boot({}, {
+    persistence: {
+      async open() {
+        return { async read() { reads += 1; await gate; return { events: openLog } }, async close() {} }
+      },
+    },
+  })
+  const reqA = fakeReq(`${API}/stream?session=slow`)
+  const resA = fakeRes()
+  app.handler(`${API}/stream`)(reqA, resA)                      // 面板 A 连上来 → 开始折历史
+  await new Promise((r) => setTimeout(r, 0))
+  // 折历史还在读盘的时候，那一轮在**别处**被中断了（实时事件到）
+  app.emit('session/event', { id: 'slow' }, { type: 'tool/result', time: T0 + 20, data: { turn: 1, step: 1, message: { role: 'tool', source: { kind: 'tool', callId: 'call_slow' }, content: [{ type: 'text', text: 'ok' }], isError: false } } })
+  app.emit('session/event', { id: 'slow' }, { type: 'turn/end', time: T0 + 30, data: { turn: 1, reason: { kind: 'interrupted' } } })
+  const reqB = fakeReq(`${API}/stream?session=slow`)
+  const resB = fakeRes()
+  app.handler(`${API}/stream`)(reqB, resB)                      // 面板 B 同时连上来
+  await new Promise((r) => setTimeout(r, 0))
+  ok('并发的两次折历史只读一遍盘（单飞，不是各折各的）', reads === 1, reads)
+  release()
+  await new Promise((r) => setTimeout(r, 50))
+  const r = fakeRes()
+  await app.handler(`${API}/trace`)(fakeReq(`${API}/trace?session=slow`), r)
+  const t1 = (r.json().turns || []).find((t) => t.turn === 1)
+  ok('折完之后**实时来的"轮结束"还在**（没被那次折历史抹掉）', t1 !== undefined && t1.endedAt !== undefined, t1 && t1.endedAt)
+  ok('那一步的工具也跟着结束了（面板不会再显示"已等…"）',
+    t1 !== undefined && t1.steps[0].tools[0].endedAt !== undefined, t1 && t1.steps[0].tools[0])
+  ok('两面板都拿到了快照（不是只有一个能建结构）',
+    resA.events().some((e) => e.t === 'snapshot') && resB.events().some((e) => e.t === 'snapshot'))
+  reqA.close()
+  reqB.close()
+
+  // ② 沉默够久 → 重折日志（换个客户端接着看的场景）
+  let logVersion = 0
+  const running = openLog
+  const ended = openLog.concat([
+    { type: 'tool/result', time: T0 + 20, data: { turn: 1, step: 1, message: { role: 'tool', source: { kind: 'tool', callId: 'call_slow' }, content: [{ type: 'text', text: 'ok' }], isError: false } } },
+    { type: 'step/end', time: T0 + 25, data: { turn: 1, step: 1 } },
+    { type: 'turn/end', time: T0 + 30, data: { turn: 1, reason: { kind: 'interrupted' } } },
+  ])
+  const stale = boot({ resyncSilenceMs: 30, resyncMaxGapMs: 60_000 }, {
+    persistence: {
+      async open() {
+        return { async read() { return { events: logVersion === 0 ? running : ended } }, async close() {} }
+      },
+    },
+  })
+  const sreq = fakeReq(`${API}/stream?session=stale`)
+  const sres = fakeRes()
+  stale.handler(`${API}/stream`)(sreq, sres)
+  await new Promise((r) => setTimeout(r, 40))
+  const first = sres.events().filter((e) => e.t === 'snapshot')
+  ok('先给的第一份快照里那一轮是"还在跑"（这就是用户看到的那份）',
+    first.length === 1 && first[0].snapshot.turns[0].endedAt === undefined, first.length)
+  // "另一个进程"把后面那些事件落盘了
+  logVersion = 1
+  await new Promise((r) => setTimeout(r, 400))
+  const snaps = sres.events().filter((e) => e.t === 'snapshot')
+  ok('沉默够久 → 自动重折日志，并把新快照推给面板', snaps.length >= 2, snaps.length)
+  const last = snaps[snaps.length - 1].snapshot.turns[0]
+  ok('重折之后那一轮变成"已结束"（面板不再谎报在跑）', last.endedAt !== undefined, last.endedAt)
+  ok('那一步的工具也结束了', last.steps[0].tools[0].endedAt !== undefined, last.steps[0].tools)
+  sreq.close()
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'}  ${pass} 通过 / ${fail} 失败\n`)

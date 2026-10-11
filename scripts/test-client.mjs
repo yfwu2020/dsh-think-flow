@@ -362,27 +362,81 @@ console.log('\n⑲ 会话头部入口：图标 + 排在最左')
 }
 
 
-console.log('\n⑳ 样式注入：热重载后必须换成新 CSS')
+console.log('\n⑳ 样式注入：一份样式 + 引用计数（两代并存时不许裸奔）')
 {
-  // 复现：DOM 里已经有一个同 id 的旧 style（上一代实例留下的）
-  const stale = { id: 'dsh-think-flow-css', tag: 'style', textContent: '/* 旧 CSS */', removed: false, remove() { this.removed = true } }
-  const appended = []
+  /*
+   * 这一节钉的是**真机踩到的那个坑**（2026-09-28 用户截图）：
+   * 面板变成一堆浏览器默认按钮（`#N`、`▸` 带边框灰底）、分组块没底色、容量条消失。
+   * 根因不是样式写错，而是**样式元素被摘掉了**：老写法"每次 apply 先摘旧的再挂新的"，
+   * 而热重载时新实例先 apply（接管了文档里那一个）、旧实例稍后 dispose ——
+   * 谁 dispose 谁摘，幸存的那一代就"有 DOM、没样式"。
+   *
+   * 新契约：全页面只有一个样式元素；apply/面板挂载各持一份引用；计数归零才摘掉。
+   */
+  const cssEls = []
+  const fakeStyle = () => {
+    const n = {
+      tag: 'style', id: '', textContent: '', className: '', parentNode: null,
+      setAttribute() {},
+      remove() { const i = cssEls.indexOf(n); if (i >= 0) cssEls.splice(i, 1); n.parentNode = null },
+    }
+    return n
+  }
+  const savedCreate = doc.createElement
   const savedHead = doc.head.appendChild
-  doc.head.appendChild = (n) => { appended.push(n) }
   const savedGet = doc.getElementById
-  doc.getElementById = (id) => (id === 'dsh-think-flow-css' ? (stale.removed ? undefined : stale) : undefined)
+  const savedRef = sandboxWindow.__dshThinkFlowCss
+  doc.createElement = (tag) => (tag === 'style' ? fakeStyle() : savedCreate(tag))
+  doc.head.appendChild = (n) => { n.parentNode = doc.head; if (cssEls.indexOf(n) < 0) cssEls.push(n) }
+  doc.getElementById = (id) => cssEls.find((n) => n.id === id) || undefined
+  // 这一节从"刚打开页面、还没人挂样式"起算：计数归零，前面那些 apply 的引用不掺进来
+  sandboxWindow.__dshThinkFlowCss = { count: 0 }
+
+  /** 带 dispose 的 ctx：`makeCtx` 只把 cleanup 返给调用方，这里替插件存起来。 */
+  const mountGen = () => {
+    const ctx2 = makeCtx()
+    const cleanups = []
+    const orig = ctx2.effect
+    ctx2.effect = (fn, name) => { const d = orig(fn, name); cleanups.push(d); return d }
+    mod.apply(ctx2)
+    return () => { cleanups.forEach((d) => { if (typeof d === 'function') d() }) }
+  }
 
   resetMount()
-  const ctx2 = makeCtx()
-  mod.apply(ctx2)
+  const disposeA = mountGen() // 第一代
+  ok('挂了样式元素', cssEls.length === 1, cssEls.length)
+  ok('内容是当前 CSS（含这轮新增的规则）', String(cssEls[0].textContent).includes('.tf-open'),
+    String(cssEls[0].textContent).slice(0, 40))
+  ok('引用计数 = 1', sandboxWindow.__dshThinkFlowCss.count === 1, sandboxWindow.__dshThinkFlowCss)
 
-  ok('旧 style 被摘掉（否则新 CSS 永远注入不进去）', stale.removed === true)
-  ok('挂了新的 style', appended.length === 1 && appended[0] !== stale, appended.length)
-  ok('新 style 里是当前 CSS（含这轮新增的规则）', String(appended[0].textContent).includes('.tf-open'),
-    String(appended[0].textContent).slice(0, 40))
+  // 第二代 apply（热重载：旧实例还没 dispose）—— 只许改写内容，不许再挂一个
+  const disposeB = mountGen()
+  ok('两代并存时仍然只有一个样式元素', cssEls.length === 1, cssEls.length)
+  ok('引用计数 = 2', sandboxWindow.__dshThinkFlowCss.count === 2, sandboxWindow.__dshThinkFlowCss)
 
+  // 最狠的顺序：**后 apply 的那一代先走**（文档里那一个就是它挂的）
+  disposeB()
+  ok('一代走了样式还在（这就是用户截图里"面板裸奔"的根因）', cssEls.length === 1, cssEls.length)
+  ok('引用计数降到 1', sandboxWindow.__dshThinkFlowCss.count === 1, sandboxWindow.__dshThinkFlowCss)
+
+  disposeA()
+  ok('最后一代走了才真的摘掉（卸载即净）', cssEls.length === 0, cssEls.length)
+  ok('计数归零', sandboxWindow.__dshThinkFlowCss.count === 0, sandboxWindow.__dshThinkFlowCss)
+
+  // 自愈：元素被别处摘掉（宿主清 head / 上一代没清干净）时补得回来
+  doc.getElementById = () => undefined // 模拟"文档里没有了"
+  const healed = []
+  const savedHead2 = doc.head.appendChild
+  doc.head.appendChild = (n) => { healed.push(n); n.parentNode = doc.head; cssEls.push(n) }
+  mod.__internals.ensureCss()
+  ok('元素没了能自愈补挂', healed.length === 1 && String(healed[0].textContent).includes('.tf-open'),
+    healed.length)
+  doc.head.appendChild = savedHead2
+
+  doc.createElement = savedCreate
   doc.head.appendChild = savedHead
   doc.getElementById = savedGet
+  sandboxWindow.__dshThinkFlowCss = savedRef || { count: 0 }
 }
 
 console.log('\n④ 渲染：没有会话')
@@ -402,8 +456,8 @@ lastEventSource.emit({
     sessionId: 'sess-1', serverTime: T0, known: true,
     turns: [{
       turn: 1, startedAt: T0, steps: [
-        { step: 1, status: 'done', attempts: 1, reasoningChars: 1362, textChars: 0, startedAt: T0, elapsedMs: 4000, tools: [{ id: 'c1', name: 'bash', argsRaw: '{"command":"cd /a && sed -n \'1,2p\' f.js"}', startedAt: T0, endedAt: T0 + 4000 }], reasoningTail: 'The user wants to create a plugin' },
-        { step: 2, status: 'thinking', attempts: 1, reasoningChars: 900, textChars: 0, startedAt: T0 + 5000, elapsedMs: 500, tools: [], reasoningTail: 'Now let me check the manifest' },
+        { step: 1, status: 'done', attempts: 1, reasoningTokens: 1362, textTokens: 0, startedAt: T0, elapsedMs: 4000, tools: [{ id: 'c1', name: 'bash', argsRaw: '{"command":"cd /a && sed -n \'1,2p\' f.js"}', startedAt: T0, endedAt: T0 + 4000 }], reasoningTail: 'The user wants to create a plugin' },
+        { step: 2, status: 'thinking', attempts: 1, reasoningTokens: 900, textTokens: 0, startedAt: T0 + 5000, elapsedMs: 500, tools: [], reasoningTail: 'Now let me check the manifest' },
       ],
     }],
   },
@@ -413,7 +467,7 @@ tree = render({ sessionId: 'sess-1' })
 {
   const t = textOf(tree)
   // ⚠️ 统计行已改成导航行（轮次即身份）：轮号 + 标题 + 目录在第二行，
-  //    步数/字数/工具回到轮头（它们是**这一轮**的数字，不是会话合计）。
+  //    步数/Token/工具回到轮头（它们是**这一轮**的数字，不是会话合计）。
   ok('第二行给出轮号与标题', t.includes('第 1 轮') && t.includes('f.js'), t.slice(0, 90))
   ok('四个会话合计不再展示', !t.includes('步骤') && !t.includes('思考 ') && !t.includes('工具 '), t.slice(0, 90))
   // 头部状态标签已删（用户点名）：这一轮在推理，但**头部不再报**这件事 ——
@@ -425,7 +479,7 @@ tree = render({ sessionId: 'sess-1' })
   ok('正在思考的步是 live 态（重点色高亮）', classesOf(tree).some((c) => c.split(' ').includes('is-live')), classesOf(tree).filter((c) => c.startsWith('tf-step')))
   ok('阶段是分组块（surface + 元信息），不是散行', classesOf(tree).some((c) => c.startsWith('tf-phase')))
   ok('全局只有一个高亮块（等待态），此时没有', !classesOf(tree).some((c) => c.includes('tf-wait')))
-  ok('容量条宽度真的随字数变化（1362 字 vs 900 字必须不同）', (() => {
+  ok('容量条宽度真的随 Token 数变化（1362 vs 900 必须不同）', (() => {
     const fills = []
     const walk = (n) => {
       if (!n || typeof n !== 'object') return
@@ -439,7 +493,9 @@ tree = render({ sessionId: 'sess-1' })
     walk(tree)
     return fills.length === 2 && fills[0] !== fills[1]
   })(), (() => { const a = []; const w = (n) => { if (!n || typeof n !== 'object') return; if (Array.isArray(n)) return n.forEach(w); if (n.props && n.props.className === 'tf-vol') { const i = (n.children||[])[0]; if (i && i.props && i.props.style) a.push(i.props.style.width) } (n.children||[]).forEach(w) }; w(tree); return a })())
-  ok('显示思考字数', t.includes('1.4k') || t.includes('900'), t.slice(0, 200))
+  ok('显示思考 Token 数', (t.includes('1.4k') || t.includes('900')) && t.includes(' tok'), t.slice(0, 200))
+  // 面板上不出现"字"这个单位（口径已经换成 Token，标签统一缩写成 tok）
+  ok('不再出现"字"这个单位', !/\d\s*字/.test(t) && !/\d(\.\d)?k\s*字/.test(t), t.slice(0, 240))
 }
 
 console.log('\n⑥ 渲染：正在等工具（本期的关键状态）')
@@ -463,7 +519,7 @@ tree = render({ sessionId: 'sess-1' })
 }
 
 console.log('\n⑦ 渲染：工具返回、继续思考')
-lastEventSource.emit({ t: 'change', change: { k: 'tool-end', turn: 1, step: 2, id: 'c9', endedAt: T0 + 47000, resultChars: 1234, status: 'thinking' } })
+lastEventSource.emit({ t: 'change', change: { k: 'tool-end', turn: 1, step: 2, id: 'c9', endedAt: T0 + 47000, resultTokens: 1234, status: 'thinking' } })
 lastEventSource.emit({ t: 'change', change: { k: 'reasoning', turn: 1, step: 2, text: ' very informative', status: 'thinking' } })
 tree = render({ sessionId: 'sess-1' })
 ok('等待块消失', !classesOf(tree).some((c) => c.includes('tf-wait')))
@@ -471,7 +527,7 @@ ok('回到思考态', classesOf(tree).some((c) => c.split(' ').includes('is-live
 ok('增量被追加到原文', textOf(tree).includes('very informative') || (mod.__internals.applyChange && true))
 
 console.log('\n⑧ 渲染：中断')
-lastEventSource.emit({ t: 'snapshot', snapshot: { sessionId: 'sess-1', serverTime: T0, known: true, turns: [{ turn: 1, interrupted: true, steps: [{ step: 1, status: 'done', reasoningChars: 100, tools: [], startedAt: T0 }, { step: 2, status: 'cut', reasoningChars: 50, tools: [], startedAt: T0 + 1000, reasoningTail: 'half a sentence' }] }] } })
+lastEventSource.emit({ t: 'snapshot', snapshot: { sessionId: 'sess-1', serverTime: T0, known: true, turns: [{ turn: 1, interrupted: true, steps: [{ step: 1, status: 'done', reasoningTokens: 100, tools: [], startedAt: T0 }, { step: 2, status: 'cut', reasoningTokens: 50, tools: [], startedAt: T0 + 1000, reasoningTail: 'half a sentence' }] }] } })
 tree = render({ sessionId: 'sess-1' })
 ok('渲染出被中断的步', classesOf(tree).some((c) => c.split(' ').includes('is-cut')), classesOf(tree).filter((c) => c.startsWith('tf-step')))
 ok('中断态给出明确说明（而不是假装还在跑）', textOf(tree).includes('停在这里'), textOf(tree).slice(0, 200))
@@ -520,8 +576,8 @@ console.log('\n⑬ 按需取原文：历史步骤也能展开（补上一直没�
     sessionId: 'sess-1', serverTime: T0, known: true,
     turns: [{
       turn: 2, startedAt: T0, steps: [
-        { step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, elapsedMs: 4200, tools: [] },
-        { step: 2, status: 'done', attempts: 1, reasoningChars: 800, textChars: 0, startedAt: T0 + 9000, elapsedMs: 5000, tools: [] },
+        { step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, elapsedMs: 4200, tools: [] },
+        { step: 2, status: 'done', attempts: 1, reasoningTokens: 800, textTokens: 0, startedAt: T0 + 9000, elapsedMs: 5000, tools: [] },
       ],
     }],
   }
@@ -583,8 +639,8 @@ console.log('\n⑭ 中文标题：渲染 + 显式生成动作')
       titles: { 1: '读懂需求与手上范例', 2: '确认插件按包名装入' },
       titlesFrom: 'p/m',
       steps: [
-        { step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, elapsedMs: 4200, tools: [{ id: 'a', name: 'bash', startedAt: T0, endedAt: T0 + 100 }] },
-        { step: 2, status: 'done', attempts: 1, reasoningChars: 800, textChars: 0, startedAt: T0 + 9000, elapsedMs: 5000, tools: [] },
+        { step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, elapsedMs: 4200, tools: [{ id: 'a', name: 'bash', startedAt: T0, endedAt: T0 + 100 }] },
+        { step: 2, status: 'done', attempts: 1, reasoningTokens: 800, textTokens: 0, startedAt: T0 + 9000, elapsedMs: 5000, tools: [] },
       ],
     }],
   }
@@ -599,7 +655,7 @@ console.log('\n⑭ 中文标题：渲染 + 显式生成动作')
   ok('快照下发的标题渲染到对应步骤', t.includes('读懂需求与手上范例') && t.includes('确认插件按包名装入'), t.slice(0, 200))
   ok('标题用了专门的类（与工具名分层）', classesOf(tree).some((c) => c === 'tf-step-title'))
   ok('已有标题时入口变成"重新生成"', t.includes('重新生成'), t.slice(0, 160))
-  ok('轮次条给出步数/字数/工具数', t.includes('第 4 轮') && t.includes('2 步'), t.slice(0, 200))
+  ok('轮次条给出步数/Token/工具数', t.includes('第 4 轮') && t.includes('2 步'), t.slice(0, 200))
 
   // 生成动作：POST 到 /titles
   const calls = []
@@ -610,7 +666,7 @@ console.log('\n⑭ 中文标题：渲染 + 显式生成动作')
   resetMount()
   let t2 = render({ sessionId: 'sess-1' })
   lastEventSource.open()
-  lastEventSource.emit({ t: 'snapshot', snapshot: { sessionId: 'sess-1', serverTime: T0, known: true, turns: [{ turn: 3, startedAt: T0, steps: [{ step: 3, status: 'done', attempts: 1, reasoningChars: 100, textChars: 0, startedAt: T0, elapsedMs: 1000, tools: [] }] }] } })
+  lastEventSource.emit({ t: 'snapshot', snapshot: { sessionId: 'sess-1', serverTime: T0, known: true, turns: [{ turn: 3, startedAt: T0, steps: [{ step: 3, status: 'done', attempts: 1, reasoningTokens: 100, textTokens: 0, startedAt: T0, elapsedMs: 1000, tools: [] }] }] } })
   t2 = render({ sessionId: 'sess-1' })
   ok('未生成时入口是"生成标题"', textOf(t2).includes('生成标题'), textOf(t2).slice(0, 120))
 
@@ -628,7 +684,7 @@ console.log('\n⑭ 中文标题：渲染 + 显式生成动作')
   resetMount()
   let t3 = render({ sessionId: 'sess-1' })
   lastEventSource.open()
-  lastEventSource.emit({ t: 'snapshot', snapshot: { sessionId: 'sess-1', serverTime: T0, known: true, turns: [{ turn: 5, startedAt: T0, steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 10, textChars: 0, startedAt: T0, elapsedMs: 100, tools: [] }] }] } })
+  lastEventSource.emit({ t: 'snapshot', snapshot: { sessionId: 'sess-1', serverTime: T0, known: true, turns: [{ turn: 5, startedAt: T0, steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 10, textTokens: 0, startedAt: T0, elapsedMs: 100, tools: [] }] }] } })
   t3 = render({ sessionId: 'sess-1' })
   findButtons(t3).find((b) => String(b.props.className || '').includes('tf-gen')).props.onClick()
   await new Promise((r) => setTimeout(r, 0))
@@ -650,17 +706,17 @@ console.log('\n⑮ 面板一次只显示一轮；「历史」是全部目录的�
     turns: [
       { turn: 1, startedAt: T0, endedAt: T0 + 60000, userText: '第一轮问了什么', titles: { 1: '第一轮的标题' },
         steps: [
-          { step: 1, status: 'done', attempts: 1, reasoningChars: 400, textChars: 0, startedAt: T0, elapsedMs: 3000, tools: [{ id: 'a', name: 'bash', startedAt: T0, endedAt: T0 + 10 }] },
-          { step: 2, status: 'done', attempts: 1, reasoningChars: 900, textChars: 0, startedAt: T0 + 5000, elapsedMs: 4000, tools: [] },
+          { step: 1, status: 'done', attempts: 1, reasoningTokens: 400, textTokens: 0, startedAt: T0, elapsedMs: 3000, tools: [{ id: 'a', name: 'bash', startedAt: T0, endedAt: T0 + 10 }] },
+          { step: 2, status: 'done', attempts: 1, reasoningTokens: 900, textTokens: 0, startedAt: T0 + 5000, elapsedMs: 4000, tools: [] },
         ] },
       { turn: 2, startedAt: T0 + 70000, endedAt: T0 + 120000, userText: '第二轮问了什么',
         steps: [
-          { step: 1, status: 'done', attempts: 1, reasoningChars: 700, textChars: 0, startedAt: T0 + 70000, elapsedMs: 3500, tools: [] },
+          { step: 1, status: 'done', attempts: 1, reasoningTokens: 700, textTokens: 0, startedAt: T0 + 70000, elapsedMs: 3500, tools: [] },
         ] },
     ],
     index: [
-      { turn: 2, startedAt: T0 + 70000, userText: '第二轮问了什么', steps: 1, tools: 0, reasoningChars: 700, textChars: 0, inMemory: true },
-      { turn: 1, startedAt: T0, userText: '第一轮问了什么', steps: 2, tools: 1, reasoningChars: 1300, textChars: 0, inMemory: true },
+      { turn: 2, startedAt: T0 + 70000, userText: '第二轮问了什么', steps: 1, tools: 0, reasoningTokens: 700, textTokens: 0, inMemory: true },
+      { turn: 1, startedAt: T0, userText: '第一轮问了什么', steps: 2, tools: 1, reasoningTokens: 1300, textTokens: 0, inMemory: true },
     ],
   }
   const findNodes = (n, cls, acc = []) => {
@@ -815,10 +871,10 @@ console.log('\n⑰ 工具详情：展开后能看到参数 / 结果大小 / 耗�
     sessionId: 'sess-1', serverTime: T0, known: true, state: 'live',
     turns: [{
       turn: 1, startedAt: T0, steps: [{
-        step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0,
+        step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0,
         startedAt: T0, elapsedMs: 4200,
         tools: [
-          { id: 'c1', name: 'bash', argsRaw: '{"command":"ls -la ~/.dsh"}', startedAt: T0, endedAt: T0 + 900, resultChars: 12345 },
+          { id: 'c1', name: 'bash', argsRaw: '{"command":"ls -la ~/.dsh"}', startedAt: T0, endedAt: T0 + 900, resultTokens: 12345 },
           { id: 'c2', name: 'find_dsh_plugin', argsRaw: '{"query":"x"}', startedAt: T0 + 1000 },
         ],
       }],
@@ -851,7 +907,7 @@ console.log('\n⑰ 工具详情：展开后能看到参数 / 结果大小 / 耗�
   tree = render({ sessionId: 'sess-1' })
   const rows = findNodesByClass(tree, 'tf-tool-row')
   ok('展开后出现工具详情行', rows.length === 2, rows.length)
-  // 工具详情行 = **工具名 + 参数原文**同一行；"返回 X 字 / 耗时"那行按用户要求去掉了
+  // 工具详情行 = **工具名 + 参数原文**同一行；"返回 X Token / 耗时"那行按用户要求去掉了
   const t = textOf(rows[0])
   ok('详情行 = 工具名 + 参数（同一行）', t.indexOf('bash') === 0 && t.includes('ls -la'), t)
   ok('不再显示返回大小与耗时', !t.includes('12k') && !t.includes('0.9s'), t)
@@ -861,7 +917,7 @@ console.log('\n⑰ 工具详情：展开后能看到参数 / 结果大小 / 耗�
   const noTitle = {
     sessionId: 'sess-1', serverTime: T0, known: true,
     turns: [{ turn: 1, startedAt: T0, steps: [{
-      step: 1, status: 'done', attempts: 1, reasoningChars: 0, textChars: 0, startedAt: T0, elapsedMs: 500,
+      step: 1, status: 'done', attempts: 1, reasoningTokens: 0, textTokens: 0, startedAt: T0, elapsedMs: 500,
       tools: [{ id: 'z1', name: 'some_new_tool', argsRaw: '{"whatever":1}', startedAt: T0 }],
     }] }],
   }
@@ -890,8 +946,8 @@ console.log('\n⑰ 工具详情：展开后能看到参数 / 结果大小 / 耗�
     // 相邻同名合并成**一行**（两个同样的 read）时不该带 is-multi —— 它只有一行，居中才对
     const merged = JSON.parse(JSON.stringify(snap))
     merged.turns[0].steps[0].tools = [
-      { id: 'm1', name: 'read', argsRaw: '{"file_path":"/a/f.js"}', startedAt: T0, endedAt: T0 + 100, resultChars: 10 },
-      { id: 'm2', name: 'read', argsRaw: '{"file_path":"/a/f.js"}', startedAt: T0, endedAt: T0 + 200, resultChars: 10 },
+      { id: 'm1', name: 'read', argsRaw: '{"file_path":"/a/f.js"}', startedAt: T0, endedAt: T0 + 100, resultTokens: 10 },
+      { id: 'm2', name: 'read', argsRaw: '{"file_path":"/a/f.js"}', startedAt: T0, endedAt: T0 + 200, resultTokens: 10 },
     ]
     resetMount()
     let tm = render({ sessionId: 'sess-1' })
@@ -909,10 +965,10 @@ console.log('\n⑰ 工具详情：展开后能看到参数 / 结果大小 / 耗�
 console.log('\n⑯b 切走再切回来：这一轮的展开/折叠与视图原样还在')
 {
   const mkStep = (n, chars, tools) => ({
-    step: n, status: 'done', attempts: 1, reasoningChars: chars, textChars: 0,
+    step: n, status: 'done', attempts: 1, reasoningTokens: chars, textTokens: 0,
     startedAt: T0 + n * 1000, elapsedMs: 800, tools: tools || [],
   })
-  const bash = (id) => ({ id, name: 'bash', argsRaw: '{"command":"cd /a && npm test"}', startedAt: T0, endedAt: T0 + 500, resultChars: 1200 })
+  const bash = (id) => ({ id, name: 'bash', argsRaw: '{"command":"cd /a && npm test"}', startedAt: T0, endedAt: T0 + 500, resultTokens: 1200 })
   // 两轮、两个阶段：方便检查"阶段块折叠"与"步骤展开"两种状态
   const snapOf = (id) => ({
     sessionId: id, serverTime: T0, known: true,
@@ -985,8 +1041,8 @@ console.log('\n⑰e 自动标题：默认关 / 开关通知宿主 / 推送合并
   const snap = {
     sessionId: 'sess-auto', serverTime: T0, known: true, auto: false,
     turns: [{ turn: 1, startedAt: T0, endedAt: T0 + 5000, steps: [
-      { step: 1, status: 'done', attempts: 1, reasoningChars: 800, textChars: 0, startedAt: T0, elapsedMs: 900,
-        tools: [{ id: 'a1', name: 'bash', argsRaw: '{"command":"cd /a && npm test"}', startedAt: T0, endedAt: T0 + 500, resultChars: 1200 }] },
+      { step: 1, status: 'done', attempts: 1, reasoningTokens: 800, textTokens: 0, startedAt: T0, elapsedMs: 900,
+        tools: [{ id: 'a1', name: 'bash', argsRaw: '{"command":"cd /a && npm test"}', startedAt: T0, endedAt: T0 + 500, resultTokens: 1200 }] },
     ] }],
   }
   const calls = []
@@ -1056,7 +1112,7 @@ console.log('\n⑰e 自动标题：默认关 / 开关通知宿主 / 推送合并
   {
     const live = JSON.parse(JSON.stringify(snap))
     live.turns[0].endedAt = undefined
-    live.turns[0].steps.push({ step: 2, status: 'thinking', attempts: 1, reasoningChars: 120, textChars: 0,
+    live.turns[0].steps.push({ step: 2, status: 'thinking', attempts: 1, reasoningTokens: 120, textTokens: 0,
       startedAt: T0, elapsedMs: 300, tools: [], reasoningTail: 'still thinking' })
     resetMount()
     let t = render({ sessionId: 'sess-live' })
@@ -1102,7 +1158,7 @@ console.log('\n⑰f 头部状态标签**已删**，只留"面板坏了"那一枚
    *    而实际是**没数据** —— 两种完全不同的处境。
    */
   const step = (n, status, tools) => ({
-    step: n, status, attempts: 1, reasoningChars: 300, textChars: 0,
+    step: n, status, attempts: 1, reasoningTokens: 300, textTokens: 0,
     startedAt: T0, elapsedMs: 900, tools: tools || [],
   })
   const tool = (id) => ({ id, name: 'bash', argsRaw: '{"command":"cd /a && npm test"}', startedAt: T0 })
@@ -1151,7 +1207,7 @@ console.log('\n⑰h 步骤行时长：一条公式 —— 活跃步实时涨、�
 {
   const I = mod.__internals
   const step = (over) => Object.assign({
-    step: 1, status: 'thinking', attempts: 1, reasoningChars: 100, textChars: 0, startedAt: T0, tools: [],
+    step: 1, status: 'thinking', attempts: 1, reasoningTokens: 100, textTokens: 0, startedAt: T0, tools: [],
   }, over)
 
   // ── ① 纯函数：三个来源的优先级 ──
@@ -1225,8 +1281,8 @@ console.log('\n⑰g 视图开关落盘：模块被重新求值也不丢')
   const snap = {
     sessionId: 'sess-persist', serverTime: T0, known: true,
     turns: [
-      { turn: 1, startedAt: T0, endedAt: T0 + 3000, steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 100, textChars: 0, startedAt: T0, elapsedMs: 200, tools: [] }] },
-      { turn: 2, startedAt: T0 + 4000, steps: [{ step: 1, status: 'thinking', attempts: 1, reasoningChars: 100, textChars: 0, startedAt: T0, elapsedMs: 200, tools: [], reasoningTail: 'x' }] },
+      { turn: 1, startedAt: T0, endedAt: T0 + 3000, steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 100, textTokens: 0, startedAt: T0, elapsedMs: 200, tools: [] }] },
+      { turn: 2, startedAt: T0 + 4000, steps: [{ step: 1, status: 'thinking', attempts: 1, reasoningTokens: 100, textTokens: 0, startedAt: T0, elapsedMs: 200, tools: [], reasoningTail: 'x' }] },
     ],
   }
   resetMount()
@@ -1266,7 +1322,7 @@ console.log('\n⑰g 视图开关落盘：模块被重新求值也不丢')
 
 console.log('\n⑰h 轮标题（① 反转布局：标题当主行、编号与元信息降为注脚）')
 {
-  const step = (n, status) => ({ step: n, status, attempts: 1, reasoningChars: 300, textChars: 0,
+  const step = (n, status) => ({ step: n, status, attempts: 1, reasoningTokens: 300, textTokens: 0,
     startedAt: T0, elapsedMs: 900, tools: [] })
   const mkSnap = (o) => ({
     sessionId: 'sess-tt', serverTime: T0, known: true, auto: !!o.auto,
@@ -1289,7 +1345,7 @@ console.log('\n⑰h 轮标题（① 反转布局：标题当主行、编号与�
   ok('标题不是"待生成"态', !String(titleEl(t).props.className).includes('is-pending'), titleEl(t).props.className)
   ok('轮头不再有标题（不重复）', findNodesByClass(head(t), 'tf-turn-title').length === 0)
   ok('轮头不再有两行形态（没有 has-title）', !String(head(t).props.className).includes('has-title'), head(t).props.className)
-  // 轮号搬到了第二行；元信息（步数/字数/工具）留在轮头
+  // 轮号搬到了第二行；元信息（步数/Token/工具）留在轮头
   ok('轮号在第二行里', findNodesByClass(findNodesByClass(t, 'tf-nav')[0], 'tf-turn-no').length === 1)
   ok('轮头里不再有轮号（不重复）', findNodesByClass(head(t), 'tf-turn-no').length === 0)
   ok('元信息仍在轮头里', findNodesByClass(head(t), 'tf-turn-meta').length === 1)
@@ -1411,7 +1467,7 @@ console.log('\n⑰b 轮次顺序：宿主给了乱序也要按轮号降序显示
   // 而面板原来是 `slice().reverse()` —— 错序被原样翻过来，第 24 轮跑到最上面。
   const mk = (turn) => ({
     turn, startedAt: T0 + turn * 1000, endedAt: T0 + turn * 1000 + 500,
-    steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 10, textChars: 0, startedAt: T0, elapsedMs: 100, tools: [] }],
+    steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 10, textTokens: 0, startedAt: T0, elapsedMs: 100, tools: [] }],
   })
   const snap = {
     sessionId: 'sess-1', serverTime: T0, known: true,
@@ -1432,10 +1488,10 @@ console.log('\n⑰b 轮次顺序：宿主给了乱序也要按轮号降序显示
 console.log('\n⑰c 视图开关：实时默认看原文 / 重挂载不丢 / 切原文展开本轮')
 {
   const mkStep = (n, status, chars, tools) => ({
-    step: n, status, attempts: 1, reasoningChars: chars, textChars: 0,
+    step: n, status, attempts: 1, reasoningTokens: chars, textTokens: 0,
     startedAt: T0 + n * 1000, elapsedMs: 800, tools: tools || [],
   })
-  const bash = (id) => ({ id, name: 'bash', argsRaw: '{"command":"cd /a && npm test"}', startedAt: T0, endedAt: T0 + 500, resultChars: 1200 })
+  const bash = (id) => ({ id, name: 'bash', argsRaw: '{"command":"cd /a && npm test"}', startedAt: T0, endedAt: T0 + 500, resultTokens: 1200 })
   // 两轮：历史一轮（已结束）+ 当前一轮（**正在想** = 实时生成中）
   const snap = {
     sessionId: 'sess-view', serverTime: T0, known: true,
@@ -1545,13 +1601,13 @@ console.log('\n⑱ 第二行 = 轮次即身份（四个会话合计已按用户�
     sessionId: 'sess-1', serverTime: T0, known: true, state: 'live',
     turns: [
       { turn: 1, startedAt: T0, endedAt: T0 + 1000, userText: '第一轮问了什么',
-        steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 1000, textChars: 0, startedAt: T0, elapsedMs: 100, tools: [{ id: 'a', name: 'bash', startedAt: T0, endedAt: T0 + 1 }] }] },
+        steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 1000, textTokens: 0, startedAt: T0, elapsedMs: 100, tools: [{ id: 'a', name: 'bash', startedAt: T0, endedAt: T0 + 1 }] }] },
       { turn: 2, startedAt: T0 + 2000, endedAt: T0 + 3000, userText: '第二轮问了什么',
-        steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 2000, textChars: 0, startedAt: T0 + 2000, elapsedMs: 100, tools: [] }] },
+        steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 2000, textTokens: 0, startedAt: T0 + 2000, elapsedMs: 100, tools: [] }] },
     ],
     index: [
-      { turn: 2, startedAt: T0 + 2000, userText: '第二轮问了什么', steps: 1, tools: 0, reasoningChars: 2000, textChars: 0, inMemory: true },
-      { turn: 1, startedAt: T0, userText: '第一轮问了什么', steps: 1, tools: 1, reasoningChars: 1000, textChars: 0, inMemory: true },
+      { turn: 2, startedAt: T0 + 2000, userText: '第二轮问了什么', steps: 1, tools: 0, reasoningTokens: 2000, textTokens: 0, inMemory: true },
+      { turn: 1, startedAt: T0, userText: '第一轮问了什么', steps: 1, tools: 1, reasoningTokens: 1000, textTokens: 0, inMemory: true },
     ],
   }
   resetMount()
@@ -1592,12 +1648,12 @@ console.log('\n㉑ 生成标题：状态必须按轮次归属')
    */
   const mkTurn = (turn) => ({
     turn, startedAt: T0, endedAt: T0 + 1000, userText: '第' + turn + '轮问了什么',
-    steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 400, textChars: 0, startedAt: T0, elapsedMs: 3000, tools: [] }],
+    steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 400, textTokens: 0, startedAt: T0, elapsedMs: 3000, tools: [] }],
   })
   const multi = {
     sessionId: 'sess-1', serverTime: T0, known: true, state: 'live',
     turns: [mkTurn(3), mkTurn(4), mkTurn(5)],
-    index: [5, 4, 3].map((n) => ({ turn: n, startedAt: T0, userText: '第' + n + '轮问了什么', steps: 1, tools: 0, reasoningChars: 400, textChars: 0, inMemory: true })),
+    index: [5, 4, 3].map((n) => ({ turn: n, startedAt: T0, userText: '第' + n + '轮问了什么', steps: 1, tools: 0, reasoningTokens: 400, textTokens: 0, inMemory: true })),
   }
   const mount = () => {
     resetMount()
@@ -1676,7 +1732,7 @@ console.log('\n㉒ 会话切换：缓存与状态不能跨会话串味')
     turns: [{
       turn: 2, startedAt: T0, endedAt: T0 + 2000,
       titles: { 1: 'TITLE OF ' + sid },
-      steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, elapsedMs: 1000, tools: [] }],
+      steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, elapsedMs: 1000, tools: [] }],
     }],
   })
   const chev = (tree) => findButtons(tree).filter((b) => String(b.props.className || '').includes('tf-chev'))
@@ -1842,12 +1898,12 @@ console.log('\n㉔ 步骤行：纯工具步也要能展开，且每行尾部必�
     turns: [{
       turn: 1, startedAt: T0, steps: [
         // ① 有思考、没工具
-        { step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, elapsedMs: 8100, tools: [] },
-        // ② 纯工具步（思考 0 字）—— 就是截图里点不开的那种
-        { step: 2, status: 'done', attempts: 1, reasoningChars: 0, textChars: 0, startedAt: T0, elapsedMs: 4100,
-          tools: [{ id: 't1', name: 'bash', argsRaw: '{"cmd":"ls -la"}', startedAt: T0, endedAt: T0 + 900, resultChars: 2048 }] },
+        { step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, elapsedMs: 8100, tools: [] },
+        // ② 纯工具步（思考 0 Token）—— 就是截图里点不开的那种
+        { step: 2, status: 'done', attempts: 1, reasoningTokens: 0, textTokens: 0, startedAt: T0, elapsedMs: 4100,
+          tools: [{ id: 't1', name: 'bash', argsRaw: '{"cmd":"ls -la"}', startedAt: T0, endedAt: T0 + 900, resultTokens: 2048 }] },
         // ③ 既没思考也没工具 —— 真的没内容可展开
-        { step: 3, status: 'done', attempts: 1, reasoningChars: 0, textChars: 0, startedAt: T0, elapsedMs: 120, tools: [] },
+        { step: 3, status: 'done', attempts: 1, reasoningTokens: 0, textTokens: 0, startedAt: T0, elapsedMs: 120, tools: [] },
       ],
     }],
   }
@@ -1891,7 +1947,7 @@ console.log('\n㉔ 步骤行：纯工具步也要能展开，且每行尾部必�
   ok('真没内容的步：占位、不可点',
     String(chevOf(rowOf(3)).props.className).includes('is-blank') && !chevOf(rowOf(3)).props.onClick, chevOf(rowOf(3)).props)
 
-  // 点纯工具步：不该去取原文（思考 0 字，取了也是个空块）
+  // 点纯工具步：不该去取原文（思考 0 Token，取了也是个空块）
   const before = calls.length
   chevOf(rowOf(2)).props.onClick()
   await new Promise((r) => setTimeout(r, 0))
@@ -1899,7 +1955,7 @@ console.log('\n㉔ 步骤行：纯工具步也要能展开，且每行尾部必�
   ok('点纯工具步不发起 /step', calls.length === before, calls.slice(before))
   const shown = textOf(tree)
   ok('展开后能看到工具名与参数', shown.includes('bash') && shown.includes('ls -la'), shown.slice(0, 300))
-  ok('不再显示返回大小与耗时（用户要求去掉）', !shown.includes('2k 字') && !shown.includes('0.9s'), shown.slice(0, 300))
+  ok('不再显示返回大小与耗时（用户要求去掉）', !shown.includes('12k tok') && !shown.includes('0.9s'), shown.slice(0, 300))
   ok('纯工具步不显示"载入原文…"', !shown.includes('载入原文'), shown.slice(0, 300))
 
   // 思考步仍然按需取原文（原行为不能丢）
@@ -1937,9 +1993,9 @@ console.log('\n㉕ 轮次小结：颜色不能按序号渐隐（否则后面的�
         const [name, args] = KIND[i % KIND.length]
         return {
           step: i + 1, status: 'done', attempts: 1,
-          // 让"交付产出"那两类的字数为 0 —— 图例对 0 字的块要报**步数**，不是报 "0"
-          reasoningChars: i % KIND.length === 6 ? 0 : 200 + i * 100,
-          textChars: 0, startedAt: T0 + i * 10000, elapsedMs: 3000,
+          // 让"交付产出"那两类的 Token 数为 0 —— 图例对 0 Token 的块要报**步数**，不是报 "0"
+          reasoningTokens: i % KIND.length === 6 ? 0 : 200 + i * 100,
+          textTokens: 0, startedAt: T0 + i * 10000, elapsedMs: 3000,
           tools: name ? [{ id: 't' + i, name: name, argsRaw: args, startedAt: T0, endedAt: T0 + 100 }] : [],
         }
       }),
@@ -1982,10 +2038,10 @@ console.log('\n㉕ 轮次小结：颜色不能按序号渐隐（否则后面的�
   ok('图例方块也一视同仁（没有按序号变淡）', dotNodes.length === segs.length && dotFaded.length === 0,
     [dotNodes.length, dotNodes.map((d) => (d.props.style || {}).opacity)])
 
-  // 宽度必须按字数分，且合计就是 100%（不能用 flex gap 额外占位，那会把尾部挤出容器）
+  // 宽度必须按 Token 数分，且合计就是 100%（不能用 flex gap 额外占位，那会把尾部挤出容器）
   const total = segs.reduce((n, s) => n + parseFloat((s.props.style || {}).width || '0'), 0)
   ok('各段宽度合计 = 100%', Math.abs(total - 100) < 0.01, total)
-  ok('宽度真的按字数分（字数多的段更宽）', (() => {
+  ok('宽度真的按 Token 数分（Token 多的段更宽）', (() => {
     const w = segs.map((s) => parseFloat((s.props.style || {}).width || '0'))
     return w[w.length - 1] > w[0]
   })(), segs.map((s) => (s.props.style || {}).width))
@@ -2003,7 +2059,8 @@ console.log('\n㉕ 轮次小结：颜色不能按序号渐隐（否则后面的�
   ok('同一次小结里出现了多种颜色（不是一片同色）', new Set(segCats).size >= 4, [...new Set(segCats)])
   // 0 字的块报步数：报 "0" 看着像坏了
   ok('0 字的块在图例里报步数（交付产出 2 步）', lgText.includes('交付产出 2 步'), lgText)
-  ok('有字数的块仍然报字数（跑命令 …k）', /跑命令 [\d.]+k/.test(lgText), lgText)
+  // 图例里只有裸数字（单位由它上面那行"N 步，思考 X tok…"交代），块名 + 数字连着读
+  ok('有 Token 的块仍然报 Token 数（跑命令 1.6k）', /跑命令 [\d.]+k/.test(lgText), lgText)
 }
 
 console.log('\n㉖ 阶段合并 + 分类配色')
@@ -2075,14 +2132,14 @@ console.log('\n㉚ 派生标题接进渲染：它是模型标题的替补')
     turns: [{
       turn: 1, startedAt: T0, endedAt: T0 + 60000,
       steps: [
-        // ① 0 字 + 认得出的命令
-        { step: 1, status: 'done', attempts: 1, reasoningChars: 0, textChars: 0, startedAt: T0, elapsedMs: 900,
-          tools: [{ id: 'a', name: 'bash', argsRaw: '{"command":"cd /a && npm test 2>&1"}', startedAt: T0, endedAt: T0 + 900, resultChars: 1200 }] },
-        // ② 0 字 + 认不出的命令 → 回落到工具名
-        { step: 2, status: 'done', attempts: 1, reasoningChars: 0, textChars: 0, startedAt: T0, elapsedMs: 500,
+        // ① 0 Token + 认得出的命令
+        { step: 1, status: 'done', attempts: 1, reasoningTokens: 0, textTokens: 0, startedAt: T0, elapsedMs: 900,
+          tools: [{ id: 'a', name: 'bash', argsRaw: '{"command":"cd /a && npm test 2>&1"}', startedAt: T0, endedAt: T0 + 900, resultTokens: 1200 }] },
+        // ② 0 Token + 认不出的命令 → 回落到工具名
+        { step: 2, status: 'done', attempts: 1, reasoningTokens: 0, textTokens: 0, startedAt: T0, elapsedMs: 500,
           tools: [{ id: 'b', name: 'bash', argsRaw: '{"command":"frobnicate --now"}', startedAt: T0, endedAt: T0 + 500 }] },
         // ③ **有思考**的步 —— 没有模型标题时，它也走派生标题
-        { step: 3, status: 'done', attempts: 1, reasoningChars: 800, textChars: 0, startedAt: T0, elapsedMs: 2000,
+        { step: 3, status: 'done', attempts: 1, reasoningTokens: 800, textTokens: 0, startedAt: T0, elapsedMs: 2000,
           tools: [{ id: 'c', name: 'bash', argsRaw: '{"command":"cd /a && npm run build"}', startedAt: T0, endedAt: T0 + 2000 }] },
       ],
     }],
@@ -2111,7 +2168,7 @@ console.log('\n㉚ 派生标题接进渲染：它是模型标题的替补')
   const rows = findNodesByClass(tree, 'tf-step-row')
   const titles = findNodesByClass(tree, 'tf-step-title').map((n) => String(textOf(n)))
   ok('0 字的步拿到派生标题', titles.includes('跑测试'), titles)
-  ok('**有思考**的步也拿到派生标题（不再限于 0 字）', titles.includes('跑构建'), titles)
+  ok('**有思考**的步也拿到派生标题（不再限于 0 Token）', titles.includes('跑构建'), titles)
   const cmdTitles = findNodesByClass(tree, 'is-cmd')
   ok('派生标题带 is-cmd 类（好跟模型标题区分）', cmdTitles.length === 2, cmdTitles.length)
   ok('派生标题没有悬停（来源靠颜色区分）', cmdTitles[0].props.title === undefined, cmdTitles[0].props.title)
@@ -2353,7 +2410,7 @@ console.log('\n㉗ 合并只发生在小结里：面板按时间顺序保持原�
       steps: Array.from({ length: 12 }, (_, i) => {
         const [name, args] = KIND[i % KIND.length]
         return {
-          step: i + 1, status: 'done', attempts: 1, reasoningChars: 300 + i * 50, textChars: 0,
+          step: i + 1, status: 'done', attempts: 1, reasoningTokens: 300 + i * 50, textTokens: 0,
           startedAt: T0 + i * 10000, elapsedMs: 2000,
           tools: [{ id: 't' + i, name, argsRaw: args, startedAt: T0, endedAt: T0 + 100 }],
         }
@@ -2497,7 +2554,7 @@ console.log('\n⑨b 阶段分组定标（用真实 turn 1 前 22 步的间隔与
     [15,348,195,['bash']],[16,2131,222,['bash']],[17,1794,255,['bash']],[18,455,267,['bash']],
     [19,2146,274,['bash']],[20,2016,298,['bash']],[21,2326,335,['bash']],[22,376,350,['bash']],
   ].map(([step, len, t, tools]) => ({
-    step, reasoningChars: len, startedAt: t * 1000,
+    step, reasoningTokens: len, startedAt: t * 1000,
     tools: tools.map((n, i) => ({ id: 'c' + step + '_' + i, name: n })),
   }))
 
@@ -2523,10 +2580,13 @@ console.log('\n⑨b 阶段分组定标（用真实 turn 1 前 22 步的间隔与
 console.log('\n⑩ 增量应用：缺口要标出来')
 {
   const st = I.emptyState()
-  st.turns = [{ turn: 1, steps: [{ step: 1, tools: [], reasoningChars: 0 }] }]
-  I.applyChange(st, { k: 'reasoning', turn: 1, step: 1, text: 'abc' })
+  st.turns = [{ turn: 1, steps: [{ step: 1, tools: [], reasoningTokens: 0 }] }]
+  I.applyChange(st, { k: 'reasoning', turn: 1, step: 1, text: 'abc', tokens: 1 })
   ok('文本被累加', st.turns[0].steps[0].reasoningText === 'abc', st.turns[0].steps[0].reasoningText)
-  ok('字数被累加', st.turns[0].steps[0].reasoningChars === 3)
+  // Token 数**照抄宿主的累计值**，客户端不自己累加（两端各取一次整必然漂）
+  ok('Token 数照抄宿主下发的累计值', st.turns[0].steps[0].reasoningTokens === 1, st.turns[0].steps[0].reasoningTokens)
+  I.applyChange(st, { k: 'reasoning', turn: 1, step: 1, text: 'def', tokens: 2 })
+  ok('下一条增量覆盖成新的累计值', st.turns[0].steps[0].reasoningTokens === 2, st.turns[0].steps[0].reasoningTokens)
   I.applyChange(st, { k: 'gap', turn: 1, step: 1 })
   ok('缺口被标记', st.turns[0].steps[0].streamGap === true)
   I.applyChange(st, { k: 'tool', turn: 1, step: 1, tool: { id: 'x', name: 'bash' } })
@@ -2560,17 +2620,17 @@ console.log('\n㉜ 目录：看更早的轮次（全轮骨架 index，不是正�
     // 正文窗口：只有 2 轮
     turns: [
       { turn: 5, startedAt: Date.parse('2026-09-25T10:00:00'), endedAt: Date.parse('2026-09-25T10:01:00'), userText: '第五轮要什么',
-        steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
+        steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
       { turn: 4, startedAt: Date.parse('2026-09-25T09:00:00'), endedAt: Date.parse('2026-09-25T09:01:00'), userText: '第四轮要什么',
-        steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 400, textChars: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
+        steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 400, textTokens: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
     ],
     // 全轮骨架：5 轮（最新在前）
     index: [
-      { turn: 5, startedAt: Date.parse('2026-09-25T10:00:00'), userText: '第五轮要什么', steps: 1, tools: 0, reasoningChars: 500, textChars: 0, inMemory: true },
-      { turn: 4, startedAt: Date.parse('2026-09-25T09:00:00'), userText: '第四轮要什么', steps: 1, tools: 0, reasoningChars: 400, textChars: 0, inMemory: true },
-      { turn: 3, startedAt: Date.parse('2026-09-24T18:00:00'), userText: '[图片已删除：截屏2026-09-21 02.22.05.png（9', steps: 3, tools: 2, reasoningChars: 300, textChars: 0, inMemory: false },
-      { turn: 2, startedAt: Date.parse('2026-09-24T17:00:00'), userText: '可以', steps: 2, tools: 1, reasoningChars: 200, textChars: 0, inMemory: false },
-      { turn: 1, startedAt: Date.parse('2026-09-23T16:00:00'), userText: '第一轮要什么', steps: 9, tools: 8, reasoningChars: 100, textChars: 0, inMemory: false },
+      { turn: 5, startedAt: Date.parse('2026-09-25T10:00:00'), userText: '第五轮要什么', steps: 1, tools: 0, reasoningTokens: 500, textTokens: 0, inMemory: true },
+      { turn: 4, startedAt: Date.parse('2026-09-25T09:00:00'), userText: '第四轮要什么', steps: 1, tools: 0, reasoningTokens: 400, textTokens: 0, inMemory: true },
+      { turn: 3, startedAt: Date.parse('2026-09-24T18:00:00'), userText: '[图片已删除：截屏2026-09-21 02.22.05.png（9', steps: 3, tools: 2, reasoningTokens: 300, textTokens: 0, inMemory: false },
+      { turn: 2, startedAt: Date.parse('2026-09-24T17:00:00'), userText: '可以', steps: 2, tools: 1, reasoningTokens: 200, textTokens: 0, inMemory: false },
+      { turn: 1, startedAt: Date.parse('2026-09-23T16:00:00'), userText: '第一轮要什么', steps: 9, tools: 8, reasoningTokens: 100, textTokens: 0, inMemory: false },
     ],
   }
   const turnNos = (t) => findNodesByClass(t, 'tf-turn-no').map((n) => String(textOf(n)).replace(/[^0-9]/g, ''))
@@ -2654,16 +2714,16 @@ console.log('\n㉝ 搜索只搜轮次（用户消息 + 轮次标题），结果�
     sessionId: 'sess-s', serverTime: T0, known: true, state: 'hydrated',
     turns: [
       { turn: 5, startedAt: Date.parse('2026-09-25T10:00:00'), endedAt: Date.parse('2026-09-25T10:01:00'), userText: '第五轮要什么',
-        steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
+        steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
     ],
     index: [
-      { turn: 5, startedAt: Date.parse('2026-09-25T10:00:00'), userText: '第五轮要什么', steps: 1, tools: 0, reasoningChars: 500, textChars: 0, inMemory: true },
-      { turn: 3, startedAt: Date.parse('2026-09-24T09:00:00'), userText: '继续', steps: 2, tools: 1, reasoningChars: 200, textChars: 0, inMemory: false },
+      { turn: 5, startedAt: Date.parse('2026-09-25T10:00:00'), userText: '第五轮要什么', steps: 1, tools: 0, reasoningTokens: 500, textTokens: 0, inMemory: true },
+      { turn: 3, startedAt: Date.parse('2026-09-24T09:00:00'), userText: '继续', steps: 2, tools: 1, reasoningTokens: 200, textTokens: 0, inMemory: false },
       // 长消息：标签会被截断 → 这种情况**需要**下面那行 snippet
       { turn: 2, startedAt: Date.parse('2026-09-24T08:00:00'),
-        userText: 'x'.repeat(40) + '长消息里的关键词' + 'y'.repeat(40), steps: 1, tools: 0, reasoningChars: 100, textChars: 0, inMemory: false },
+        userText: 'x'.repeat(40) + '长消息里的关键词' + 'y'.repeat(40), steps: 1, tools: 0, reasoningTokens: 100, textTokens: 0, inMemory: false },
       { turn: 1, startedAt: Date.parse('2026-09-23T16:00:00'), userText: '把 README 里改 host 代码不会热重载那段改掉',
-        title: '热重载与插件重载的区别', steps: 4, tools: 3, reasoningChars: 900, textChars: 0, inMemory: false },
+        title: '热重载与插件重载的区别', steps: 4, tools: 3, reasoningTokens: 900, textTokens: 0, inMemory: false },
     ],
   }
   const turnNos = (t) => findNodesByClass(t, 'tf-turn-no').map((n) => String(textOf(n)).replace(/[^0-9]/g, ''))
@@ -2681,7 +2741,7 @@ console.log('\n㉝ 搜索只搜轮次（用户消息 + 轮次标题），结果�
       ok: true, sessionId: 'sess-s',
       turn: { turn: 1, startedAt: Date.parse('2026-09-23T16:00:00'), endedAt: Date.parse('2026-09-23T16:10:00'),
         userText: '把 README 里改 host 代码不会热重载那段改掉', title: '热重载与插件重载的区别',
-        steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 900, textChars: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
+        steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 900, textTokens: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
     }) })
   }
   resetMount()
@@ -2800,11 +2860,11 @@ console.log('\n㉞ 搜索框也能搜轮次（轮次号 → 一条普通结果�
     sessionId: 'sess-j', serverTime: T0, known: true, state: 'hydrated',
     turns: [
       { turn: 5, startedAt: Date.parse('2026-09-25T10:00:00'), endedAt: Date.parse('2026-09-25T10:01:00'), userText: '第五轮要什么',
-        steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
+        steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
     ],
     index: [
-      { turn: 5, startedAt: Date.parse('2026-09-25T10:00:00'), userText: '第五轮要什么', steps: 1, tools: 0, reasoningChars: 500, textChars: 0, inMemory: true },
-      { turn: 1, startedAt: Date.parse('2026-09-23T16:00:00'), userText: '把 README 里改 host 代码不会热重载那段改掉', steps: 4, tools: 3, reasoningChars: 900, textChars: 0, inMemory: false },
+      { turn: 5, startedAt: Date.parse('2026-09-25T10:00:00'), userText: '第五轮要什么', steps: 1, tools: 0, reasoningTokens: 500, textTokens: 0, inMemory: true },
+      { turn: 1, startedAt: Date.parse('2026-09-23T16:00:00'), userText: '把 README 里改 host 代码不会热重载那段改掉', steps: 4, tools: 3, reasoningTokens: 900, textTokens: 0, inMemory: false },
     ],
   }
   const turnNos = (t) => findNodesByClass(t, 'tf-turn-no').map((n) => String(textOf(n)).replace(/[^0-9]/g, ''))
@@ -2823,7 +2883,7 @@ console.log('\n㉞ 搜索框也能搜轮次（轮次号 → 一条普通结果�
       ok: true, sessionId: 'sess-j',
       turn: { turn: 1, startedAt: Date.parse('2026-09-23T16:00:00'), endedAt: Date.parse('2026-09-23T16:10:00'),
         userText: '把 README 里改 host 代码不会热重载那段改掉',
-        steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 900, textChars: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
+        steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 900, textTokens: 0, startedAt: T0, elapsedMs: 10, tools: [] }] },
     }) })
   }
   const props = { sessionId: 'sess-j' }
@@ -2945,14 +3005,14 @@ console.log('\n㉟ 相邻轮次步进器：轮号两侧的两个小箭头（设�
    */
   const mkT = (n, text) => ({
     turn: n, startedAt: T0 - n * 1000, endedAt: T0, userText: text,
-    steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, elapsedMs: 10, tools: [] }],
+    steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, elapsedMs: 10, tools: [] }],
   })
   const stepSnap = {
     sessionId: 'sess-step', serverTime: T0, known: true, state: 'hydrated',
     turns: [mkT(5, '第五轮问了什么'), mkT(4, '第四轮问了什么'), mkT(3, '第三轮问了什么')],
     index: [5, 4, 3, 2, 1].map((n) => ({
       turn: n, startedAt: T0 - n * 1000, userText: '第' + n + '轮问了什么',
-      steps: 1, tools: 0, reasoningChars: 100, textChars: 0, inMemory: n >= 3,
+      steps: 1, tools: 0, reasoningTokens: 100, textTokens: 0, inMemory: n >= 3,
     })),
   }
   const props = { sessionId: 'sess-step' }
@@ -3063,10 +3123,10 @@ console.log('\n㊲ 目录：搜索钉在顶上，提示语与真实能力一致'
   const snap = {
     sessionId: 'sess-dir2', serverTime: T0, known: true, state: 'hydrated',
     turns: [{ turn: 2, startedAt: T0, endedAt: T0 + 1000, userText: '第二轮问了什么',
-      steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, elapsedMs: 10, tools: [] }] }],
+      steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, elapsedMs: 10, tools: [] }] }],
     index: [
-      { turn: 2, startedAt: T0, userText: '第二轮问了什么', steps: 1, tools: 0, reasoningChars: 500, textChars: 0, inMemory: true },
-      { turn: 1, startedAt: T0 - 90000, userText: '第一轮问了什么', steps: 3, tools: 2, reasoningChars: 900, textChars: 0, inMemory: false },
+      { turn: 2, startedAt: T0, userText: '第二轮问了什么', steps: 1, tools: 0, reasoningTokens: 500, textTokens: 0, inMemory: true },
+      { turn: 1, startedAt: T0 - 90000, userText: '第一轮问了什么', steps: 3, tools: 2, reasoningTokens: 900, textTokens: 0, inMemory: false },
     ],
   }
   const props = { sessionId: 'sess-dir2' }
@@ -3136,14 +3196,14 @@ console.log('\n㊱ 第二行 = 轮次即身份（用户选定的 ③）')
   const mk = (n, text, o) => ({
     turn: n, startedAt: T0 + n * 1000, endedAt: T0 + n * 1000 + 500,
     userText: text, ...(o && o.turnTitle !== undefined ? { turnTitle: o.turnTitle } : {}),
-    steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, elapsedMs: 10, tools: [] }],
+    steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, elapsedMs: 10, tools: [] }],
   })
   const snap = {
     sessionId: 'sess-nav', serverTime: T0, known: true, state: 'hydrated',
     turns: [mk(3, '第三轮问了什么'), mk(2, '第二轮问了什么', { turnTitle: '模型给的第二轮标题' })],
     index: [3, 2, 1].map((n) => ({
       turn: n, startedAt: T0 + n * 1000, userText: '第' + n + '轮问了什么',
-      steps: 1, tools: 0, reasoningChars: 500, textChars: 0, inMemory: n >= 2,
+      steps: 1, tools: 0, reasoningTokens: 500, textTokens: 0, inMemory: n >= 2,
     })),
   }
   const props = { sessionId: 'sess-nav' }
@@ -3167,7 +3227,7 @@ console.log('\n㊱ 第二行 = 轮次即身份（用户选定的 ③）')
   ok('轮头里既没有轮号也没有标题（不重复）',
     findNodesByClass(findNodesByClass(tree, 'tf-turn-h')[0], 'tf-turn-no').length === 0
     && findNodesByClass(findNodesByClass(tree, 'tf-turn-h')[0], 'tf-turn-title').length === 0)
-  ok('轮头里该有的还在（步数/字数/工具）',
+  ok('轮头里该有的还在（步数/Token/工具）',
     findNodesByClass(findNodesByClass(tree, 'tf-turn-h')[0], 'tf-turn-meta').length === 1)
 
   // ⑥b 两个动作各自的位置（历史按钮**已删** → 入口是第二行标题的双击；生成标题在第二行）
@@ -3302,7 +3362,7 @@ console.log('\n㊱ 第二行 = 轮次即身份（用户选定的 ③）')
   ok('任何状态下都没有焦点条', findNodesByClass(tree, 'tf-focus-bar').length === 0)
   /*
    * ⚠️ 只扫**顶栏那两行**（.tf-head + .tf-nav），不扫整个面板 ——
-   *    正文里本来就有一句合法的阶段小结"思考 500 字，调用工具 0 次"，
+   *    正文里本来就有一句合法的阶段小结"思考 500 Token，调用工具 0 次"，
    *    扫全文会把它当成"统计行又回来了"（第一版就假红在这里）。
    */
   const chromeText = textOf(navOf(tree)) + ' ' + textOf(findNodesByClass(tree, 'tf-head')[0])
@@ -3329,9 +3389,9 @@ console.log('\n㊳ 骨架会长：新增的轮要进「历史」入口与目录�
     sessionId: 'sess-skel', serverTime: T0, known: true, state: 'live',
     turns: [{
       turn: 1, startedAt: T0, endedAt: T0 + 1000, userText: '第一轮问了什么',
-      steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 100, textChars: 0, startedAt: T0, elapsedMs: 10, tools: [] }],
+      steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 100, textTokens: 0, startedAt: T0, elapsedMs: 10, tools: [] }],
     }],
-    index: [{ turn: 1, startedAt: T0, userText: '第一轮问了什么', steps: 1, tools: 0, reasoningChars: 100, textChars: 0, inMemory: true }],
+    index: [{ turn: 1, startedAt: T0, userText: '第一轮问了什么', steps: 1, tools: 0, reasoningTokens: 100, textTokens: 0, inMemory: true }],
   }
   const props = { sessionId: 'sess-skel' }
   /*
@@ -3389,7 +3449,7 @@ console.log('\n㊴ 进行中的块不许叫「纯推理」（用户："运行中
    */
   const I2 = mod.__internals
   const mkStep = (no, status, tools, at) => ({
-    step: no, status, attempts: 1, reasoningChars: 500, textChars: 0,
+    step: no, status, attempts: 1, reasoningTokens: 500, textTokens: 0,
     startedAt: at, elapsedMs: 1000, tools: tools || [],
   })
 
@@ -3572,7 +3632,7 @@ console.log('\n㊵ 进行中的块穿"状态的衣服"：状态色 + 空心环�
   // ── ② 渲染：跑着的轮次，那一块挂 is-running；等待再加 is-wait ──
   const props = { sessionId: 'sess-1' }
   const mk = (no, status, tools, at) => ({
-    step: no, status, attempts: 1, reasoningChars: 400, textChars: 0, startedAt: at, elapsedMs: 900, tools: tools || [],
+    step: no, status, attempts: 1, reasoningTokens: 400, textTokens: 0, startedAt: at, elapsedMs: 900, tools: tools || [],
   })
   const mountWith = (snap) => {
     resetMount()
@@ -3630,7 +3690,7 @@ console.log('\n㊶ 进行中的块：主标题是「第 N 步」，状态词降�
    */
   const props = { sessionId: 'sess-1' }
   const mk = (no, status, tools, at) => ({
-    step: no, status, attempts: 1, reasoningChars: 400, textChars: 0, startedAt: at, elapsedMs: 900, tools: tools || [],
+    step: no, status, attempts: 1, reasoningTokens: 400, textTokens: 0, startedAt: at, elapsedMs: 900, tools: tools || [],
   })
   const mountWith = (snap) => {
     resetMount()
@@ -3692,45 +3752,45 @@ console.log('\n㊷ 一轮的最后一步叫「回答」，不叫「纯推理」�
    */
   const I2 = mod.__internals
   const mk = (no, status, opts) => Object.assign({
-    step: no, status, attempts: 1, reasoningChars: 500, textChars: 0,
+    step: no, status, attempts: 1, reasoningTokens: 500, textTokens: 0,
     startedAt: T0 + no * 1000, elapsedMs: 1000, tools: [],
   }, opts || {})
   const bashTool = (id) => ({ id, name: 'bash', argsRaw: '{"command":"npm test"}', startedAt: T0 })
 
   // ① 典型一轮：工具步 + 最后一步是答复
-  let ps = I2.groupPhases([mk(1, 'done', { tools: [bashTool('t1')] }), mk(2, 'done', { textChars: 800 })])
+  let ps = I2.groupPhases([mk(1, 'done', { tools: [bashTool('t1')] }), mk(2, 'done', { textTokens: 800 })])
   ok('最后一步（有正文、没工具）→ 块名叫「回答」', ps[1].label === '回答', ps.map((x) => x.label))
   ok('它仍然是灰类（想）—— 不改颜色', ps[1].cat === 'think' && I2.phaseCategory('回答') === 'think', [ps[1].cat, I2.phaseCategory('回答')])
   ok('前面那块照旧按工具族叫（没被带歪）', ps[0].label === '跑命令', ps[0].label)
 
   // ② 还在吐字 → 推理中；落地之后才叫回答（同一份数据只改状态）
-  ps = I2.groupPhases([mk(1, 'thinking', { textChars: 0 })])
+  ps = I2.groupPhases([mk(1, 'thinking', { textTokens: 0 })])
   ok('最后一步还在推理 → 推理中（不叫回答，也不叫纯推理）', ps[0].label === '推理中', ps[0].label)
-  ps = I2.groupPhases([mk(1, 'thinking', { textChars: 300 })])
+  ps = I2.groupPhases([mk(1, 'thinking', { textTokens: 300 })])
   ok('正在吐正文、但还没落地 → 还是推理中（没落地不许用分类语法）', ps[0].label === '推理中', ps[0].label)
-  ps = I2.groupPhases([mk(1, 'done', { textChars: 300 })])
+  ps = I2.groupPhases([mk(1, 'done', { textTokens: 300 })])
   ok('同一份数据落地之后 → 回答', ps[0].label === '回答', ps[0].label)
 
   // ③ 三条判据各自缺一条都不算
-  ps = I2.groupPhases([mk(1, 'done', { tools: [bashTool('t2')], textChars: 500 })])
+  ps = I2.groupPhases([mk(1, 'done', { tools: [bashTool('t2')], textTokens: 500 })])
   ok('最后一步**带工具**（正文+工具）→ 按工具族叫，不叫回答', ps[0].label === '跑命令', ps[0].label)
-  ps = I2.groupPhases([mk(1, 'done', { reasoningChars: 900, textChars: 0 })])
+  ps = I2.groupPhases([mk(1, 'done', { reasoningTokens: 900, textTokens: 0 })])
   ok('最后一步只有思考、没有正文 → 仍是纯推理', ps[0].label === '纯推理', ps[0].label)
-  ps = I2.groupPhases([mk(1, 'done', { reasoningChars: 0, textChars: 0 })])
+  ps = I2.groupPhases([mk(1, 'done', { reasoningTokens: 0, textTokens: 0 })])
   ok('最后一步完全空（命令轮 / 空转轮）→ 仍是纯推理', ps[0].label === '纯推理', ps[0].label)
 
   // ④ 只有**最后一步**算：中间步有正文也不算回答
-  ps = I2.groupPhases([mk(1, 'done', { textChars: 400 }), mk(2, 'done', { tools: [bashTool('t3')] })])
+  ps = I2.groupPhases([mk(1, 'done', { textTokens: 400 }), mk(2, 'done', { tools: [bashTool('t3')] })])
   ok('中间步有正文、但工具在最后 → 不叫回答', !ps.some((x) => x.label === '回答'), ps.map((x) => x.label))
 
   // ⑤ 小结图例跟着走（mergeByLabel 的 key 就是 label）
-  const merged = I2.mergeByLabel(I2.groupPhases([mk(1, 'done', { tools: [bashTool('t4')] }), mk(2, 'done', { textChars: 600 })]))
+  const merged = I2.mergeByLabel(I2.groupPhases([mk(1, 'done', { tools: [bashTool('t4')] }), mk(2, 'done', { textTokens: 600 })]))
   ok('小结图例里也出现「回答」（和块名同一个 key）', merged.some((x) => x.label === '回答'), merged.map((x) => x.label))
 
   // ⑥ 渲染层：块头写「回答」，这一轮里不再出现「纯推理」
   const snap = { sessionId: 'sess-answer', serverTime: T0, known: true, turns: [{ turn: 1, startedAt: T0, endedAt: T0 + 9000, userText: 'x', steps: [
     mk(1, 'done', { tools: [bashTool('t5')] }),
-    mk(2, 'done', { textChars: 800 }),
+    mk(2, 'done', { textTokens: 800 }),
   ] }] }
   resetMount()
   let t = render({ sessionId: 'sess-answer' })
@@ -3755,7 +3815,7 @@ console.log('\n㊸ 进行中的块：只有一个步骤 + 只留标题的步号�
    */
   const I2 = mod.__internals
   const mk = (no, status, opts) => Object.assign({
-    step: no, status, attempts: 1, reasoningChars: 400, textChars: 0,
+    step: no, status, attempts: 1, reasoningTokens: 400, textTokens: 0,
     startedAt: T0 + no * 1000, elapsedMs: 1000, tools: [],
   }, opts || {})
   const bash = (id) => ({ id, name: 'bash', argsRaw: '{"command":"npm test"}', startedAt: T0 + 500 })
@@ -3821,7 +3881,7 @@ console.log('\n㊸ 进行中的块：只有一个步骤 + 只留标题的步号�
     !/\.tf-phase\.is-running \.tf-no\{visibility:hidden\}/.test(css))
 }
 
-console.log('\n㊹ 无工具步的名字：正文摘要 / 「无输出」/ 不填（用户："为哪些没有标题的步骤起名字"）')
+console.log('\n㊹ 无工具步的名字：正文摘要 / 只有思考写「思考」/ 什么都没有画三个点（用户："为哪些没有标题的步骤起名字"）')
 {
   /**
    * 面板上有两条起名路，各有过滤条件：**派生标题**要工具参数、**模型标题**要思考。
@@ -3858,16 +3918,33 @@ console.log('\n㊹ 无工具步的名字：正文摘要 / 「无输出」/ 不�
   ok('短正文整句给（不加省略号）', I2.excerptOf('已经改好了。') === '已经改好了。', I2.excerptOf('已经改好了。'))
   ok('空正文 → 空串（不编）', I2.excerptOf('') === '' && I2.excerptOf('   \n  ') === '', [I2.excerptOf(''), I2.excerptOf('   ')])
 
-  // ── ② stepOwnTitle：三类各走各的 ──
-  ok('有正文 → 摘要', I2.stepOwnTitle({ textChars: 100, textHead: '已经改好了，测试也过了。' }) === '已经改好了，测试也过了。',
-    I2.stepOwnTitle({ textChars: 100, textHead: '已经改好了，测试也过了。' }))
-  ok('什么都没有（0 思考 0 正文 0 工具）→ 「无输出」', I2.stepOwnTitle({ textChars: 0, reasoningChars: 0, tools: [] }) === '无输出',
-    I2.stepOwnTitle({ textChars: 0, reasoningChars: 0, tools: [] }))
-  ok('只有思考（还没写正文）→ **不填**（不硬起名，块头已经写着推理中）',
-    I2.stepOwnTitle({ textChars: 0, reasoningChars: 500, tools: [] }) === '',
-    I2.stepOwnTitle({ textChars: 0, reasoningChars: 500, tools: [] }))
+  // ── ② stepOwnTitle：有正文才给摘要，别的都吐空串（渲染层再按"有没有思考"画） ──
+  ok('有正文 → 摘要', I2.stepOwnTitle({ textTokens: 100, textHead: '已经改好了，测试也过了。' }) === '已经改好了，测试也过了。',
+    I2.stepOwnTitle({ textTokens: 100, textHead: '已经改好了，测试也过了。' }))
+  ok('什么都没有（0 思考 0 正文 0 工具）→ 空串（不再吐「无输出」那种占位词）',
+    I2.stepOwnTitle({ textTokens: 0, reasoningTokens: 0, tools: [] }) === '',
+    I2.stepOwnTitle({ textTokens: 0, reasoningTokens: 0, tools: [] }))
+  ok('只有思考（还没写正文）→ 空串（不硬起名，具体画什么由渲染层定）',
+    I2.stepOwnTitle({ textTokens: 0, reasoningTokens: 500, tools: [] }) === '',
+    I2.stepOwnTitle({ textTokens: 0, reasoningTokens: 500, tools: [] }))
+  // 悬停里两种"没有标题"分开说（只说事实，不猜）
+  ok('没有标题的悬停：0/0/0 说"没有产出"',
+    I2.noTitleNote({ textTokens: 0, reasoningTokens: 0, tools: [] }).indexOf('没有产出') >= 0,
+    I2.noTitleNote({ textTokens: 0, reasoningTokens: 0, tools: [] }))
+  ok('没有标题的悬停：只有思考时说"还没有正文"',
+    I2.noTitleNote({ textTokens: 0, reasoningTokens: 500, tools: [] }).indexOf('还没有正文') >= 0,
+    I2.noTitleNote({ textTokens: 0, reasoningTokens: 500, tools: [] }))
+  // 画什么由"有没有思考"分（用户定的两条）
+  ok('只有思考时那句是「思考」', I2.THINK_TITLE === '思考', I2.THINK_TITLE)
+  ok('什么都没有时那三个点用 `·`（中线上，`…` 落在基线上太低）', I2.DOT === '·', I2.DOT)
+  ok('有没有思考：reasoningTokens > 0 → 有',
+    I2.stepHasThinking({ reasoningTokens: 500, tools: [] }) === true)
+  ok('有没有思考：实时尾巴也算（reasoningTokens 还没落）',
+    I2.stepHasThinking({ reasoningTokens: 0, reasoningText: 'ids…', tools: [] }) === true)
+  ok('有没有思考：0/0/0 → 没有',
+    I2.stepHasThinking({ reasoningTokens: 0, tools: [] }) === false)
   {
-    const tailTitle = I2.stepOwnTitle({ textChars: 30, textTail: '刚写完开头，后面还有一大段要继续写下去，还没写完呢。' })
+    const tailTitle = I2.stepOwnTitle({ textTokens: 30, textTail: '刚写完开头，后面还有一大段要继续写下去，还没写完呢。' })
     ok('有正文但开头没带下来 → 用尾部兜底（活跃步正在写，标题立刻就有）',
       tailTitle.indexOf('刚写完开头') === 0 && tailTitle.slice(-1) === '…' && tailTitle.length <= 21, tailTitle)
   }
@@ -3883,25 +3960,97 @@ console.log('\n㊹ 无工具步的名字：正文摘要 / 「无输出」/ 不�
   }
   const titlesOf = (t) => findNodesByClass(t, 'tf-step-title').map((n) => String(textOf(n)).trim())
   let t = mountWith(snapOf([
-    { step: 1, status: 'done', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, tools: [{ id: 'a', name: 'bash', argsRaw: '{"command":"npm test"}', startedAt: T0, endedAt: T0 + 1 }] },
-    { step: 2, status: 'done', attempts: 1, reasoningChars: 0, textChars: 120, textHead: '已经改好了，测试也过了。后面还有一段。', startedAt: T0 + 1000, tools: [] },
+    { step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, tools: [{ id: 'a', name: 'bash', argsRaw: '{"command":"npm test"}', startedAt: T0, endedAt: T0 + 1 }] },
+    { step: 2, status: 'done', attempts: 1, reasoningTokens: 0, textTokens: 120, textHead: '已经改好了，测试也过了。后面还有一段。', startedAt: T0 + 1000, tools: [] },
   ]))
   ok('回答步的行标题 = 正文摘要（本地摘要类名 is-own）',
     titlesOf(t).some((x) => x === '已经改好了，测试也过了…') && findNodesByClass(t, 'tf-step-title').some((n) => String(n.props.className).includes('is-own')),
     titlesOf(t))
   ok('有工具的步照旧用派生标题（不受影响）', titlesOf(t).indexOf('跑测试') >= 0, titlesOf(t))
 
-  t = mountWith(snapOf([{ step: 1, status: 'done', attempts: 1, reasoningChars: 0, textChars: 0, startedAt: T0, tools: [] }]))
-  ok('空步的行标题 = 「无输出」', titlesOf(t).indexOf('无输出') >= 0, titlesOf(t))
+  t = mountWith(snapOf([{ step: 1, status: 'done', attempts: 1, reasoningTokens: 0, textTokens: 0, startedAt: T0, tools: [] }]))
+  ok('空步的行标题 = 三个点（不是「无输出」、也不是一个 `…`）',
+    titlesOf(t).join('').replace(/\s/g, '') === '···' && titlesOf(t).indexOf('无输出') < 0, titlesOf(t))
+  ok('三个点用 is-none 类（和本地摘要 is-own 分档）',
+    findNodesByClass(t, 'tf-step-title').some((n) => String(n.props.className).includes('is-none')),
+    findNodesByClass(t, 'tf-step-title').map((n) => n.props.className))
+  ok('三个点分成三个节点（错开亮要能各自动）',
+    findNodesByClass(t, 'tf-none-dot').length === 3, findNodesByClass(t, 'tf-none-dot').length)
+  ok('三个点带 `.is-dots`（进行中块的微光要放过它们）',
+    findNodesByClass(t, 'is-dots').length === 1
+    && String(findNodesByClass(t, 'is-dots')[0].props.className).includes('is-none'),
+    findNodesByClass(t, 'tf-step-title').map((n) => n.props.className))
+  ok('空步的悬停说清"为什么没有"',
+    String(findNodesByClass(t, 'tf-step-title')[0].props.title).indexOf('没有产出') >= 0,
+    findNodesByClass(t, 'tf-step-title')[0].props.title)
+  // 落地之后的空步**不许一直闪**：动画只在 .is-live / .is-wait 上
+  {
+    const css = String(mod.__internals.CSS)
+    ok('三个点的动画只在"进行中"上开（落地后不闪）',
+      css.includes('.tf-step.is-live .tf-step-title.is-none .tf-none-dot,.tf-step.is-wait .tf-step-title.is-none .tf-none-dot{opacity:1;animation:tf-none-dot 1.5s ease-in-out infinite}'),
+      css.match(/\.tf-step\.is-live \.tf-step-title\.is-none \.tf-none-dot[^}]*\}/))
+    ok('静止时三个点同深（不是半亮半灭）',
+      css.includes('.tf-step-title.is-none .tf-none-dot{display:inline-block;opacity:.45}'), css.match(/\.tf-none-dot\{[^}]*\}/))
+    ok('三点的亮是错开的（第二、第三个各带 delay）',
+      css.includes('.tf-step.is-live .tf-step-title.is-none .tf-none-dot+.tf-none-dot,.tf-step.is-wait .tf-step-title.is-none .tf-none-dot+.tf-none-dot{animation-delay:.2s}')
+      && css.includes('.tf-step.is-live .tf-step-title.is-none .tf-none-dot+.tf-none-dot+.tf-none-dot,.tf-step.is-wait .tf-step-title.is-none .tf-none-dot+.tf-none-dot+.tf-none-dot{animation-delay:.4s}'), true)
+    /* ⚠️ 错开那条的选择器必须和 `animation` 简写那条**一样长**：简写会把 delay 重置成 0s，
+       权重不够的话三个点会一起亮（真踩到过） */
+    ok('错开那条的权重压得过 animation 简写（否则三个点会一起亮）',
+      !css.includes('tf-none-dot:nth-child(2)')
+      && css.includes('.tf-step.is-live .tf-step-title.is-none .tf-none-dot+.tf-none-dot,.tf-step.is-wait'), true)
+    /* ⚠️ 类名撞车真踩过：`.tf-dot` 早就是错误胶囊里那枚 5px 小圆点（`.tf-badge .tf-dot`），
+       裸规则会漏到它身上（opacity .45 → 那枚圆点变半透明） */
+    ok('没有裸的 `.tf-dot` 规则（错误胶囊那枚小圆点不受影响）',
+      !/(^|,)\.tf-dot\{/.test(css) && css.includes('.tf-badge .tf-dot{width:5px'), css.match(/(^|,)\s*\.tf-dot\{[^}]*\}/))
+    ok('降级（reduced-motion）时不动、但仍然看得见',
+      css.includes('prefers-reduced-motion:reduce){.tf-step.is-live .tf-step-title.is-none .tf-none-dot')
+      && css.includes('animation:none;opacity:.45'),
+      css.match(/@media \(prefers-reduced-motion:reduce\)\{.*?tf-none-dot[^}]*\}/))
+  }
 
-  t = mountWith(snapOf([{ step: 1, status: 'thinking', attempts: 1, reasoningChars: 500, textChars: 0, startedAt: T0, tools: [] }]))
-  ok('只有思考的步**没有**行标题（不硬填状态词）', titlesOf(t).length === 0, titlesOf(t))
+  t = mountWith(snapOf([{ step: 1, status: 'thinking', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, tools: [] }]))
+  ok('只有思考、还没正文 → 行标题写「思考」（用户定的）',
+    titlesOf(t).length === 1 && titlesOf(t)[0] === '思考', titlesOf(t))
+  ok('只有思考的步：悬停说"还没有正文"',
+    String(findNodesByClass(t, 'tf-step-title')[0].props.title).indexOf('还没有正文') >= 0,
+    findNodesByClass(t, 'tf-step-title')[0].props.title)
 
-  // ── ④ 展开区：回答步现在点得开，而且能看到正文 ──
+  // 落地的"只有思考"步也一样是「思考」——不能落地就换成三个点（那是丢信息）
+  t = mountWith(snapOf([{ step: 1, status: 'done', attempts: 1, reasoningTokens: 500, textTokens: 0, startedAt: T0, endedAt: T0 + 900, tools: [] }]))
+  ok('落地的"只有思考"步仍然是「思考」', titlesOf(t).join('') === '思考', titlesOf(t))
+
+  // ── ④ 进行中的块：标题文字上一道微光扫过（用户："除了 · · · ，其他标题文字都加上"）──
+  {
+    const css = String(mod.__internals.CSS)
+    // 扫过的是**这三样**：块头主标题、块头状态词、步骤行标题（除 `.is-dots`）
+    ok('微光扫过：块头主标题 + 状态词 + 步骤行标题都在内',
+      css.includes('.tf-phase.is-running .tf-phase-name,.tf-phase.is-running .tf-phase-sub,.tf-phase.is-running .tf-step-title:not(.is-dots)'), true)
+    ok('微光扫过把渐变裁到文字上（background-clip:text）',
+      css.includes('-webkit-background-clip:text;background-clip:text'), true)
+    // ⚠️ 必须是 `-webkit-text-fill-color`，不能是 `color:transparent`：后者会让渐变里的
+    //    `currentColor` 一起透明 —— 基色就没了（整个标题会消失）
+    ok('基色靠 currentColor 保住（不是 color:transparent）',
+      css.includes('-webkit-text-fill-color:transparent')
+      && !/(^|[;{])color:transparent/.test(css), css.match(/[;{]color:transparent/))
+    ok('亮带掺的是这一块的 --tf-hue（等待态自动变琥珀）',
+      css.includes('color-mix(in srgb, var(--tf-hue) 60%, var(--dsw-alias-label-primary)) 50%'), true)
+    ok('扫动只动 background-position（无缝循环：两端都停在基色）',
+      css.includes('@keyframes tf-sweep{from{background-position:100% 0}to{background-position:-100% 0}}')
+      && css.includes('currentColor 0%,currentColor 42%') && css.includes('currentColor 58%,currentColor 100%'), true)
+    ok('降级（reduced-motion）时微光整个撤掉、字恢复原样',
+      css.includes('prefers-reduced-motion:reduce){.tf-phase.is-running .tf-phase-name')
+      && css.includes('background-image:none;-webkit-text-fill-color:currentColor'), true)
+    ok('三个点被排除在微光之外（否则错开的亮会废）',
+      css.includes('.tf-step-title:not(.is-dots)')
+      && css.includes('-webkit-text-fill-color:transparent'), true)
+  }
+
+  // ── ⑤ 展开区：回答步现在点得开，而且能看到正文 ──
   // ⚠️ 轮头那个折叠箭头也是 `.tf-chev`（`<span>`），所以要按**按钮**数，
   //    否则会把轮头那个数进来（真踩过：断言写 1 结果数出 2）。
   ok('回答步可展开（行里有展开按钮）',
-    findButtons(mountWith(snapOf([{ step: 1, status: 'done', attempts: 1, reasoningChars: 0, textChars: 120, textHead: 'x', startedAt: T0, tools: [] }])))
+    findButtons(mountWith(snapOf([{ step: 1, status: 'done', attempts: 1, reasoningTokens: 0, textTokens: 120, textHead: 'x', startedAt: T0, tools: [] }])))
       .filter((b) => String(b.props.className || '').includes('tf-chev')).length === 1)
   {
     const calls = []
@@ -3909,7 +4058,7 @@ console.log('\n㊹ 无工具步的名字：正文摘要 / 「无输出」/ 不�
       calls.push(String(url))
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ reasoning: 'THINK', text: 'ANSWER BODY', streamGap: false }) })
     }
-    const t2 = mountWith(snapOf([{ step: 1, status: 'done', attempts: 1, reasoningChars: 0, textChars: 120, textHead: '已经改好了。', startedAt: T0, tools: [] }]))
+    const t2 = mountWith(snapOf([{ step: 1, status: 'done', attempts: 1, reasoningTokens: 0, textTokens: 120, textHead: '已经改好了。', startedAt: T0, tools: [] }]))
     // 点开（走真实 onClick）
     const chev = findButtons(t2).find((b) => String(b.props.className || '').includes('tf-chev'))
     ok('回答步有展开按钮', chev !== undefined)
@@ -3938,12 +4087,12 @@ console.log('\n㊺ 双击轮次标题 → 第二行变搜索框（用户："不�
   const snap = {
     sessionId: 'sess-nav', serverTime: T0, known: true, state: 'live',
     turns: [
-      { turn: 2, startedAt: T0 + 5000, endedAt: T0 + 6000, userText: '第二轮问了什么', steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 10, textChars: 0, startedAt: T0, elapsedMs: 5, tools: [] }] },
-      { turn: 1, startedAt: T0, endedAt: T0 + 1000, userText: '第一轮问了什么', steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 10, textChars: 0, startedAt: T0, elapsedMs: 5, tools: [] }] },
+      { turn: 2, startedAt: T0 + 5000, endedAt: T0 + 6000, userText: '第二轮问了什么', steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 10, textTokens: 0, startedAt: T0, elapsedMs: 5, tools: [] }] },
+      { turn: 1, startedAt: T0, endedAt: T0 + 1000, userText: '第一轮问了什么', steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 10, textTokens: 0, startedAt: T0, elapsedMs: 5, tools: [] }] },
     ],
     index: [
-      { turn: 2, startedAt: T0 + 5000, userText: '第二轮问了什么', steps: 1, tools: 0, reasoningChars: 10, textChars: 0, inMemory: true },
-      { turn: 1, startedAt: T0, endedAt: T0 + 1000, userText: '第一轮问了什么', steps: 1, tools: 0, reasoningChars: 10, textChars: 0, inMemory: true },
+      { turn: 2, startedAt: T0 + 5000, userText: '第二轮问了什么', steps: 1, tools: 0, reasoningTokens: 10, textTokens: 0, inMemory: true },
+      { turn: 1, startedAt: T0, endedAt: T0 + 1000, userText: '第一轮问了什么', steps: 1, tools: 0, reasoningTokens: 10, textTokens: 0, inMemory: true },
     ],
   }
   const props = { sessionId: 'sess-nav' }
@@ -4006,7 +4155,7 @@ console.log('\n㊺ 双击轮次标题 → 第二行变搜索框（用户："不�
   resetMount()
   let t2 = render(props)
   lastEventSource.open()
-  lastEventSource.emit({ t: 'snapshot', snapshot: { sessionId: 'sess-nav', serverTime: T0, known: true, state: 'live', turns: [{ turn: 1, startedAt: T0, steps: [{ step: 1, status: 'done', attempts: 1, reasoningChars: 10, textChars: 0, startedAt: T0, elapsedMs: 5, tools: [] }] }] } })
+  lastEventSource.emit({ t: 'snapshot', snapshot: { sessionId: 'sess-nav', serverTime: T0, known: true, state: 'live', turns: [{ turn: 1, startedAt: T0, steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 10, textTokens: 0, startedAt: T0, elapsedMs: 5, tools: [] }] }] } })
   t2 = render(props)
   ok('没有标题的轮给"无标题"占位（入口唯一的落点）',
     String(textOf(titleOf(t2))) === '无标题' && String(titleOf(t2).props.className).includes('is-empty'),
@@ -4098,7 +4247,7 @@ console.log('\n㊻ 工具失败：行里一枚红标，展开区跟着一条红�
 {
   /**
    * 症状：宿主早就把失败写进了日志（`message.isError` + `error.code`），
-   * 而面板**只记了 `endedAt` 和 `resultChars`** —— 失败的调用和成功的长得一模一样。
+   * 而面板**只记了 `endedAt` 和 `resultTokens`** —— 失败的调用和成功的长得一模一样。
    * 于是"这一步白跑了吗"在面板上永远没有答案，只能去翻日志。
    *
    * 夹具里 `failed` 的字段名逐个来自宿主（见 trace.ts 的 ToolFailure）：
@@ -4112,11 +4261,11 @@ console.log('\n㊻ 工具失败：行里一枚红标，展开区跟着一条红�
     sessionId: 'sess-1', serverTime: T0, known: true, state: 'live',
     turns: [{
       turn: 1, startedAt: T0, steps: [{
-        step: 1, status: 'done', attempts: 1, reasoningChars: 300, textChars: 0,
+        step: 1, status: 'done', attempts: 1, reasoningTokens: 300, textTokens: 0,
         startedAt: T0, elapsedMs: 3000,
         tools: [
-          { id: 'c1', name: 'ask_user_question', argsRaw: '{"questions":[{"id":"mount"}]}', startedAt: T0, endedAt: T0 + 200, resultChars: 128, failed: FAIL },
-          { id: 'c2', name: 'read', argsRaw: '{"file_path":"/a/b.js"}', startedAt: T0 + 300, endedAt: T0 + 400, resultChars: 900 },
+          { id: 'c1', name: 'ask_user_question', argsRaw: '{"questions":[{"id":"mount"}]}', startedAt: T0, endedAt: T0 + 200, resultTokens: 128, failed: FAIL },
+          { id: 'c2', name: 'read', argsRaw: '{"file_path":"/a/b.js"}', startedAt: T0 + 300, endedAt: T0 + 400, resultTokens: 900 },
         ],
       }],
     }],
@@ -4191,11 +4340,11 @@ console.log('\n㊻ 工具失败：行里一枚红标，展开区跟着一条红�
   // ── 实时路径：不等下次快照，`tool-end` 一到就红 ──
   const st = I.emptyState()
   st.turns = [{ turn: 1, steps: [{ step: 1, tools: [{ id: 'x', name: 'bash', startedAt: T0 }] }] }]
-  I.applyChange(st, { k: 'tool-end', turn: 1, step: 1, id: 'x', endedAt: T0 + 5, resultChars: 20, failed: { code: 'TOOL_TIMEOUT', text: 'tool call timed out after 30000ms' } })
+  I.applyChange(st, { k: 'tool-end', turn: 1, step: 1, id: 'x', endedAt: T0 + 5, resultTokens: 20, failed: { code: 'TOOL_TIMEOUT', text: 'tool call timed out after 30000ms' } })
   const live = st.turns[0].steps[0].tools[0]
   ok('增量里的失败落到工具上', live.failed && live.failed.code === 'TOOL_TIMEOUT', live.failed)
   // 后到的**成功**结果不得抹掉已有的失败态（事件可重放/乱序）
-  I.applyChange(st, { k: 'tool-end', turn: 1, step: 1, id: 'x', endedAt: T0 + 6, resultChars: 20 })
+  I.applyChange(st, { k: 'tool-end', turn: 1, step: 1, id: 'x', endedAt: T0 + 6, resultTokens: 20 })
   ok('后到的成功增量不抹掉失败态', live.failed && live.failed.code === 'TOOL_TIMEOUT', live.failed)
 
   // ── 颜色：红必须在真主题下读得出来（照 ㉓ 的办法，解析真 token 算对比度）──
@@ -4249,6 +4398,498 @@ console.log('\n㊻ 工具失败：行里一枚红标，展开区跟着一条红�
     ok(`${theme}：失败红在四个色相的块底上都读得出（最差 ${worst.toFixed(2)}，需 ≥ 3）`, worst >= 3,
       +worst.toFixed(2))
   }
+}
+
+console.log('\n㊼ 进行中的块：标题上那道微光，在真主题下既读得出、也看得见')
+{
+  /**
+   * 用户："进行中的块 除了 · · · ，其他标题文字都加上微光扫过的效果"。
+   *
+   * 这道微光把字形填充交给渐变（`background-clip:text`），所以**亮带就是文字的颜色**：
+   * 它要是太浅，扫过去的那一刻字就"读没了"。这里照 ㉓ / ㊻ 的办法解析**宿主真 token**
+   * 算对比度，两个主题、两种状态色（跑着的蓝 / 等待的琥珀）、三档基色（primary /
+   * secondary / tertiary —— 块头主标题、状态词、步骤行标题各占一档）全都过一遍。
+   *
+   * 亮带 = `color-mix(in srgb, var(--tf-hue) 60%, --dsw-alias-label-primary)`；
+   * 底   = 块自己的底 `color-mix(in srgb, var(--tf-hue) 7%, markdown-code-block)`。
+   * 门槛取 3.0（和 ㊻ 同一档）：拦的是"换主题后扫过去字糊了"这种真退化，
+   * 不是把宿主配色判错。
+   */
+  const themeFile = themePath()
+  const themeSrc = themeFile ? readFileSync(themeFile, 'utf8') : ''
+  const defOf = (name, nth) => {
+    const all = []
+    let i = 0
+    while ((i = themeSrc.indexOf(name + ':', i)) >= 0) { all.push(themeSrc.slice(i + name.length + 1, themeSrc.indexOf(';', i))); i += 1 }
+    return all[nth]
+  }
+  const resolve = (name, nth) => {
+    let v = defOf(name, nth)
+    for (let k = 0; k < 6; k += 1) {
+      const m = v && /^var\((--[a-z0-9-]+)\)$/.exec(String(v).trim())
+      if (!m) break
+      v = defOf(m[1], nth)
+    }
+    return v
+  }
+  const rgbOf = (v) => {
+    const m = /^#([0-9a-f]{3,8})$/i.exec(String(v ?? '').trim())
+    if (!m) return null
+    const h = m[1].length <= 4 ? m[1].split('').map((c) => c + c).join('') : m[1]
+    return [0, 2, 4].map((k) => parseInt(h.slice(k, k + 2), 16))
+  }
+  const lumOf = (rgb) => {
+    const f = (c) => { const x = c / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4 }
+    return 0.2126 * f(rgb[0]) + 0.7152 * f(rgb[1]) + 0.0722 * f(rgb[2])
+  }
+  const contrast = (a, b) => { const [x, y] = [lumOf(a), lumOf(b)].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05) }
+  /** `color-mix(in srgb, a w%, b)` —— 和 CSS 那条同一个算法（sRGB 上线性插值）。 */
+  const mix = (a, b, w) => a.map((c, i) => Math.round(c * w + b[i] * (1 - w)))
+  const dist = (a, b) => Math.round(Math.sqrt(a.reduce((s, c, i) => s + (c - b[i]) ** 2, 0)))
+
+  ok('微光那条规则用的掺法就是这里算的（改了颜色记得同步）',
+    String(mod.__internals.CSS).includes('color-mix(in srgb, var(--tf-hue) 60%, var(--dsw-alias-label-primary))'), true)
+  for (const [nth, theme] of [[0, '浅色'], [1, '深色']]) {
+    const block = rgbOf(resolve('--dsw-alias-markdown-code-block', nth))
+    const primary = rgbOf(resolve('--dsw-alias-label-primary', nth))
+    let worstRead = Infinity
+    let worstSee = Infinity
+    for (const hueTok of ['--dsw-alias-state-business-primary', '--dsw-alias-state-warn-primary']) {
+      const hue = rgbOf(resolve(hueTok, nth))
+      const surface = mix(hue, block, 0.07)
+      const band = mix(hue, primary, 0.6)
+      for (const baseTok of ['--dsw-alias-label-primary', '--dsw-alias-label-secondary', '--dsw-alias-label-tertiary']) {
+        const base = rgbOf(resolve(baseTok, nth))
+        worstRead = Math.min(worstRead, contrast(band, surface))
+        worstSee = Math.min(worstSee, dist(base, band))
+      }
+    }
+    ok(`${theme}：亮带在块底上读得出（最差 ${worstRead.toFixed(2)}，需 ≥ 3）`, worstRead >= 3, +worstRead.toFixed(2))
+    ok(`${theme}：亮带和基色分得开（最小色距 ${worstSee}，需 ≥ 24）`, worstSee >= 24, worstSee)
+  }
+}
+
+
+// ───────────────────── ㊽ 定位：点轮次号 → 主会话跳过去 ─────────────────────
+//
+// 这一节验的是**真去碰宿主 DOM** 的那套代码（`__internals.locate*`）。真机上它坏掉的表现
+// 是"点了没反应"，所以判定（认视图 / 找刻度 / 找轨迹行）全部用**假 DOM** 喂进去验，
+// 最后两条端到端再走完整动作（滚动 + 闪一下）。
+console.log('\n㊽ 定位：点轮次号 → 主会话跳过去（对话 / 轨迹各一套落位）')
+
+/**
+ * 极简假 DOM：只支持这套代码用到的选择器形态（`tag[attr]` / `tag[attr="值"]`，逗号分组）。
+ *
+ * 为什么值得写：定位那一半**没有能单测的纯函数**（它读的就是宿主的 DOM），
+ * 而它又是最容易"看着对、点下去没反应"的一类代码。
+ */
+function fakeDom() {
+  const match = (el, sel) => {
+    const m = /^([a-zA-Z]*)((?:\[[^\]]+\])*)$/.exec(sel)
+    if (m === null) return false
+    if (m[1] !== '' && el.tagName !== m[1].toUpperCase()) return false
+    const clauses = m[2] ? m[2].match(/\[[^\]]+\]/g) : []
+    for (const c of clauses) {
+      const inner = c.slice(1, -1)
+      const eq = inner.indexOf('=')
+      if (eq < 0) { if (el.getAttribute(inner) === null) return false; continue }
+      const want = inner.slice(eq + 1).replace(/^["']|["']$/g, '')
+      if (el.getAttribute(inner.slice(0, eq)) !== want) return false
+    }
+    return true
+  }
+  const walk = (node, fn) => { for (const k of node.children) { fn(k); walk(k, fn) } }
+  const el = (tag, attrs, children) => {
+    const list = children || []
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      attrs: Object.assign({}, attrs),
+      children: list,
+      parentElement: null,
+      offsetWidth: 10,
+      clientHeight: 0,
+      scrollHeight: 0,
+      classes: new Set(),
+      __st: 0,
+      __rect: { top: 0, height: 30 },
+      textContent: Object.prototype.hasOwnProperty.call(attrs || {}, '__text') ? String(attrs.__text) : '',
+      getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? String(this.attrs[name]) : null },
+      getBoundingClientRect() { return { top: this.__rect.top, bottom: this.__rect.top + this.__rect.height, height: this.__rect.height, left: 0, right: 100, width: 100 } },
+      closest(sel) { let n = this; while (n) { if (match(n, sel)) return n; n = n.parentElement } return null },
+      scrollIntoView() { this.__scrolledIntoView = true },
+      click() { this.__clicks = (this.__clicks || 0) + 1 },
+      querySelector(sel) { return this.querySelectorAll(sel)[0] || null },
+      querySelectorAll(sel) {
+        const groups = String(sel).split(',').map((x) => x.trim())
+        const out = []
+        walk(this, (n) => { if (groups.some((g) => match(n, g))) out.push(n) })
+        return out
+      },
+    }
+    node.classList = { add: (c) => node.classes.add(c), remove: (c) => node.classes.delete(c), contains: (c) => node.classes.has(c) }
+    node.dataset = {}
+    for (const [k, v] of Object.entries(node.attrs)) {
+      if (!k.startsWith('data-')) continue
+      node.dataset[k.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = v
+    }
+    /**
+     * `scrollTop` 一写，**子树整体上移**（真 DOM 就是这样：滚动条动的是内容，
+     * 容器自己的 rect 不动）。不给这个行为的话，"滚完再看一眼"那条校正逻辑
+     * 在假 DOM 里永远判不到位。
+     */
+    Object.defineProperty(node, 'scrollTop', {
+      // `configurable` 是给"迷你虚拟滚动"那种用例留的：它要自己接管这个 setter，
+      // 把"换窗口"接在滚动上（不接的话假 DOM 里永远不会重渲染，测不到路标跳那一段）。
+      configurable: true,
+      get() { return this.__st },
+      set(v) {
+        const d = v - this.__st
+        this.__st = v
+        walk(this, (k) => { k.__rect.top -= d })
+      },
+    })
+    for (const k of list) k.parentElement = node
+    return node
+  }
+  return { el }
+}
+const DOMKIT = fakeDom()
+/**
+ * 把假 DOM 挂成 bundle 眼里的 `document`。
+ *
+ * ⚠️ 不能换 `globalThis.document` —— bundle 是用 `new Function(..., 'document', ...)`
+ *    求值的，顶层那个 `document` 是**参数**（桩对象），换全局变量它看不见。
+ *    所以这里就地给桩对象补上 `querySelector(All)`，跑完再摘掉。
+ */
+const withFakeDocument = (root, fn) => {
+  const prevQ = doc.querySelector
+  const prevQA = doc.querySelectorAll
+  const fake = DOMKIT.el('body', {}, [root])
+  doc.querySelector = (sel) => fake.querySelector(sel)
+  doc.querySelectorAll = (sel) => fake.querySelectorAll(sel)
+  try { return fn() } finally {
+    if (prevQ === undefined) delete doc.querySelector; else doc.querySelector = prevQ
+    if (prevQA === undefined) delete doc.querySelectorAll; else doc.querySelectorAll = prevQA
+  }
+}
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// ① 第二行那枚轮次号现在是个**按钮**（可聚焦、能回车、读屏念得出来）
+{
+  const snap = {
+    sessionId: 'sess-locate', serverTime: T0, known: true, state: 'live',
+    turns: [{ turn: 1, startedAt: T0, endedAt: T0 + 1000, userText: '问了一句', steps: [{ step: 1, status: 'done', attempts: 1, reasoningTokens: 5, textTokens: 0, startedAt: T0, elapsedMs: 5, tools: [] }] }],
+    index: [{ turn: 1, startedAt: T0, userText: '问了一句', steps: 1, tools: 0, reasoningTokens: 5, textTokens: 0, inMemory: true }],
+  }
+  resetMount()
+  render({ sessionId: 'sess-locate' })
+  lastEventSource.open()
+  lastEventSource.emit({ t: 'snapshot', snapshot: snap })
+  const tree = render({ sessionId: 'sess-locate' })
+  const no = findNodesByClass(tree, 'tf-turn-no')[0]
+  ok('轮次号是个 <button>（不是挂 onClick 的 span）', no && no.type === 'button', no && no.type)
+  ok('轮次号带 is-locate（样式要按按钮清干净）', no && String(no.props.className).includes('is-locate'))
+  ok('悬停/读屏说清点了会发生什么',
+    no && /定位/.test(String(no.props.title)) && /定位/.test(String(no.props['aria-label'])),
+    no && no.props.title)
+  ok('点了不冒泡（别把轮头自己的折叠带起来）', (() => {
+    let stopped = false
+    no.props.onClick({ stopPropagation() { stopped = true } })
+    return stopped
+  })())
+  // 主会话不在对话/轨迹页时：什么都不做，也不许炸
+  ok('主会话没开/不在两个页面里 → 点了是空操作（不抛）', (() => {
+    try { no.props.onClick({ stopPropagation() {} }); return true } catch (e) { return false }
+  })())
+  const css = String(mod.__internals.CSS)
+  ok('CSS 把按钮那套默认样式清掉了（字号/内边距一变整行会挪）',
+    /\.tf-turn-no\.is-locate\{[^}]*box-sizing:border-box[^}]*border:0[^}]*background:none[^}]*padding:0 1px/.test(css))
+  // 用户："落位不要闪一下底纹" —— 定位**不给自己加任何底色/动画**：
+  // 对话页靠滚动位置说话，轨迹页靠**宿主的选中态**说话（见下面那条端到端）。
+  ok('定位不给自己加底色/动画（闪底纹那套已删干净）',
+    !/tf-locate/.test(css) && !/tf-locate/.test(String(mod.__internals.CSS)))
+}
+
+// ② 判定：主会话现在显示哪个视图
+{
+  const chat = DOMKIT.el('div', {}, [DOMKIT.el('div', { 'data-chat-turn': '2' })])
+  const traj = DOMKIT.el('div', {}, [DOMKIT.el('div', { 'data-trajectory-scroll': '' })])
+  const other = DOMKIT.el('div', {}, [DOMKIT.el('div', { 'data-something-else': '1' })])
+  ok('认得出对话页（靠视图自己的 data-chat-turn，不读标签文字）', mod.__internals.mainViewOf(chat) === 'chat')
+  ok('认得出轨迹页', mod.__internals.mainViewOf(traj) === 'trajectory')
+  ok('别的视图 → 不认识（不去猜、也不替用户切视图）', mod.__internals.mainViewOf(other) === null)
+  ok('没有会话内容区 → 不认识', mod.__internals.mainViewOf(null) === null)
+}
+
+// ③ 刻度上的轮号：从宿主下发的 aria-label 里取数（本地化无关）
+{
+  const mark = DOMKIT.el('button', { 'data-index': '3', 'aria-label': '加载并跳转到第 7 轮' })
+  const en = DOMKIT.el('button', { 'data-index': '4', 'aria-label': 'Jump to turn 7' })
+  ok('中文标签取得到轮号', mod.__internals.turnOfMark(mark) === 7)
+  ok('英文标签也取得到（不写死中文）', mod.__internals.turnOfMark(en) === 7)
+  ok('没有标签 → null（而不是 NaN 乱找）', mod.__internals.turnOfMark(DOMKIT.el('button', { 'data-index': '0' })) === null)
+}
+
+// ④ 轨迹行：轮次起点行 / 渲染区间
+{
+  const mkRow = (turn, kind, children) => {
+    const cells = [DOMKIT.el('span', { __text: '#' + turn })]
+    const row = DOMKIT.el('tr', { 'data-trajectory-row-key': 'k' + turn, 'data-kind': kind, 'data-turn-start': 'true' }, cells.concat(children || []))
+    return row
+  }
+  const pane = DOMKIT.el('div', { 'data-trajectory-scroll': '' }, [
+    mkRow(4, 'user'), mkRow(6, 'user'),
+  ])
+  ok('找得到第 N 轮的起点行', mod.__internals.trajTurnRow(pane, 6) === pane.children[1])
+  ok('找不到就是 null', mod.__internals.trajTurnRow(pane, 5) === null)
+  const seen = mod.__internals.trajRenderedTurns(pane)
+  ok('读得出渲染出来的轮次区间', seen.min === 4 && seen.max === 6, seen)
+}
+
+// ⑤ 端到端：对话页（目标那一轮**已经渲染出来** → 自己滚 + 闪一下）
+{
+  await (async () => {
+    const scroller = DOMKIT.el('div', { 'data-conversation-scroll': '' })
+    const row = DOMKIT.el('div', { 'data-chat-turn': '3', 'data-chat-flow-kind': 'user' })
+    row.__rect = { top: 500, height: 40 }
+    scroller.children = [row]
+    row.parentElement = scroller
+    const content = DOMKIT.el('div', { 'data-conversation-content': '' }, [DOMKIT.el('div', { 'data-chat-flow': '' }), scroller])
+    const fired = withFakeDocument(content, () => mod.__internals.locateMainTurn('sess-x', 3, undefined))
+    await sleepMs(320)
+    ok('认下这次动作（是对话页）', fired === true)
+    ok('把这一轮滚到了视口顶部附近（留 24px）', Math.abs(scroller.scrollTop - 476) <= 1, scroller.scrollTop)
+    ok('不给自己加底色（落位只动滚动位置）', !row.classList.contains('tf-locate'))
+    mod.__internals.locateStop()
+  })()
+}
+
+// ⑥ 端到端：轨迹页（目标那一轮已经渲染出来 → 居中 + 闪一下）
+{
+  await (async () => {
+    const label = DOMKIT.el('span', {})
+    label.textContent = '#7'
+    const userRow = DOMKIT.el('tr', { 'data-trajectory-row-key': 'r7', 'data-kind': 'user', 'data-turn-start': 'true' }, [label])
+    const pane = DOMKIT.el('div', { 'data-trajectory-scroll': '' }, [userRow])
+    pane.__rect = { top: 0, height: 600 }
+    pane.clientHeight = 600
+    pane.scrollHeight = 900
+    userRow.__rect = { top: 100, height: 30 }
+    const content = DOMKIT.el('div', { 'data-conversation-content': '' }, [
+      DOMKIT.el('span', { 'data-turn': '7' }), pane,
+    ])
+    const fired = withFakeDocument(content, () => mod.__internals.locateMainTurn('sess-x', 7, 42))
+    await sleepMs(500)
+    ok('轨迹页也认这次动作', fired === true)
+    ok('目标那一行在视野里（居中之后仍在框内）',
+      userRow.getBoundingClientRect().top >= 0 && userRow.getBoundingClientRect().bottom <= 600,
+      userRow.getBoundingClientRect())
+    ok('轨迹页**选中**这一行（走宿主的选中动作：点它）', userRow.__clicks === 1, userRow.__clicks)
+    ok('选中不是我们自己画的（不加底色/类名，选中态归宿主）', !userRow.classList.contains('tf-locate'))
+    mod.__internals.locateStop()
+  })()
+}
+
+
+// ───────────────────── ㊾ 步骤号：点了在轨迹页跳过去并选中这一步 ─────────────────────
+//
+// 用户："添加功能，在轨迹页面点击步骤号可直接跳转并选中这一步"。
+// 轨迹页的行**身份里就写着 (轮, 步)**（宿主自己给的 `assistant\0<轮>\0<步>`），
+// 所以"哪一行是哪一步"不用猜也不用数 —— 读出来、按它找、点它。
+console.log('\n㊾ 步骤号：轨迹页跳过去并选中这一步（行的身份里带着轮和步）')
+
+// ① 面板里的步骤号现在是个按钮
+{
+  const snap = {
+    sessionId: 'sess-step', serverTime: T0, known: true, state: 'live',
+    turns: [{
+      turn: 1, startedAt: T0, endedAt: T0 + 1000, userText: '问了一句',
+      steps: [
+        { step: 1, status: 'done', attempts: 1, reasoningTokens: 10, textTokens: 0, startedAt: T0, elapsedMs: 5, tools: [] },
+        { step: 2, status: 'done', attempts: 1, reasoningTokens: 10, textTokens: 0, startedAt: T0 + 100, elapsedMs: 5, tools: [] },
+      ],
+    }],
+    index: [{ turn: 1, startedAt: T0, userText: '问了一句', steps: 2, tools: 0, reasoningTokens: 20, textTokens: 0, inMemory: true }],
+  }
+  resetMount()
+  render({ sessionId: 'sess-step' })
+  lastEventSource.open()
+  lastEventSource.emit({ t: 'snapshot', snapshot: snap })
+  const tree = render({ sessionId: 'sess-step' })
+  const nos = findNodesByClass(tree, 'tf-no')
+  ok('步骤号是 <button>（不是挂 onClick 的 span）', nos.length === 2 && nos.every((n) => n.type === 'button'), nos.map((n) => n.type))
+  ok('步骤号带 is-locate（样式要按按钮清干净）', nos.length === 2 && nos.every((n) => String(n.props.className).includes('is-locate')))
+  ok('悬停/读屏说清点了会发生什么（带轮号和步号）',
+    /第 1 轮第 1 步/.test(String(nos[0].props.title)) && /第 1 轮第 1 步/.test(String(nos[0].props['aria-label'])),
+    nos[0].props.title)
+  ok('点了不冒泡（这一步所在的那一行自己也点得动）', (() => {
+    let stopped = false
+    nos[0].props.onClick({ stopPropagation() { stopped = true } })
+    return stopped
+  })())
+  ok('主会话不在轨迹页 → 点了是空操作（不抛）', (() => {
+    try { nos[0].props.onClick({ stopPropagation() {} }); return true } catch (e) { return false }
+  })())
+  ok('CSS 把按钮那套默认样式清掉了（行首定宽格，多几个像素整行会挪）',
+    /\.tf-no\.is-locate\{[^}]*box-sizing:border-box[^}]*border:0[^}]*background:none[^}]*padding:0/.test(String(mod.__internals.CSS)))
+}
+
+// ② 行身份：assistant\0轮\0步
+{
+  const key = mod.__internals.trajStepKey(12, 7)
+  ok('身份就是 assistant\\0轮\\0步', key === 'assistant\u000012\u00007', JSON.stringify(key))
+  const row = DOMKIT.el('tr', { 'data-trajectory-row-key': encodeURIComponent(key) })
+  const parsed = mod.__internals.trajStepOf(row)
+  ok('从行上解得出 (轮, 步)', parsed !== null && parsed.turn === 12 && parsed.step === 7, parsed)
+  const wrapped = DOMKIT.el('tr', { 'data-trajectory-row-key': encodeURIComponent(key + '\u0000summary\u0000assistant') })
+  ok('折叠成摘要行也认（身份后面缀了 summary）', mod.__internals.trajStepOf(wrapped) !== null)
+  ok('工具行解不出步（它按 callId 命名）',
+    mod.__internals.trajStepOf(DOMKIT.el('tr', { 'data-trajectory-row-key': encodeURIComponent('tool\u0000call\u0000x') })) === null)
+  const pane = DOMKIT.el('div', {}, [row])
+  ok('按身份找得到那一行', mod.__internals.trajRowByKey(pane, key) === row)
+  ok('没有那一行时是 null', mod.__internals.trajRowByKey(pane, mod.__internals.trajStepKey(1, 1)) === null)
+}
+
+// ③ 端到端：轨迹页里跳到某一步并选中它（含"那一步还没渲染出来"那条路）
+{
+  await (async () => {
+    /*
+     * 造一个 200 步的假表格 + **迷你虚拟滚动**：`scrollTop` 一变就换窗口里那几十行。
+     * 不模拟这个的话，"按 (轮, 步) 路标找"那段在假 DOM 上会永远一次命中 —— 等于没测。
+     */
+    const N = 200
+    const rows = []
+    for (let k = 1; k <= N; k += 1) {
+      const lab = DOMKIT.el('span', {})
+      lab.textContent = '#7'
+      const row = DOMKIT.el('tr', Object.assign({
+        'data-trajectory-row-key': encodeURIComponent(mod.__internals.trajStepKey(7, k)),
+        'data-kind': 'message',
+      }, k === 1 ? { 'data-turn-start': 'true' } : {}), [lab])
+      rows.push(row)
+    }
+    const pane = DOMKIT.el('div', { 'data-trajectory-scroll': '' }, [])
+    pane.__rect = { top: 0, height: 300 }
+    pane.clientHeight = 300
+    pane.scrollHeight = N * 30
+    const renderWindow = (st) => {
+      const from = Math.max(0, Math.floor(st / 30) - 10)
+      const to = Math.min(N, from + 40)
+      const win = rows.slice(from, to)
+      win.forEach((r, i) => { r.__rect = { top: (from + i) * 30 - st, height: 30 }; r.parentElement = pane })
+      pane.children = win
+    }
+    Object.defineProperty(pane, 'scrollTop', {
+      get() { return pane.__st === undefined ? 0 : pane.__st },
+      set(v) { pane.__st = v; renderWindow(v) },
+    })
+    renderWindow(0)
+    const content = DOMKIT.el('div', { 'data-conversation-content': '' }, [DOMKIT.el('span', { 'data-turn': '7' }), pane])
+
+    // ① 目标已经在窗口里（第 3 步）→ 直接滚到中间并选中
+    const fired = withFakeDocument(content, () => mod.__internals.locateMainStep('s', 7, 3, undefined))
+    await sleepMs(600)
+    ok('轨迹页认这次动作（步的目标）', fired === true)
+    ok('已经渲染出来的那一步被**选中**（点了它）', rows[2].__clicks === 1, rows[2].__clicks)
+    mod.__internals.locateStop()
+
+    // ② 目标在很后面（第 150 步，窗口里根本没有）→ 按路标一跳一屏找过去，再选中
+    withFakeDocument(content, () => mod.__internals.locateMainStep('s', 7, 150, undefined))
+    await sleepMs(4000)
+    ok('远的那一步最终被滚到并选中', rows[149].__clicks === 1, rows[149].__clicks)
+    ok('选中之后它就在视野里', rows[149].__rect.top >= -4 && rows[149].__rect.top + 30 <= 304, rows[149].__rect)
+    mod.__internals.locateStop()
+  })()
+}
+
+
+// ④ 模型顺序乱了也要能找到（压缩过的会话：时间轴上的轮次边界实测是 3,4,1,5,6）
+//
+// 二分那套假设"轮号越大越靠下"。可真机上同一个会话里第 6 轮的行被排在第 5、7 轮**后面** ——
+// 二分一步都走不动（点轮次号没反应）。兜底扫描与顺序无关，靠它把这一轮捞出来。
+{
+  await (async () => {
+    const ROWS = 30
+    /** 位置 0..9 = 第 5 轮，10..19 = 第 7 轮，20..29 = 第 6 轮（目标，被排在后面）。 */
+    const layout = []
+    for (let i = 0; i < 10; i += 1) layout.push(5)
+    for (let i = 0; i < 10; i += 1) layout.push(7)
+    for (let i = 0; i < 10; i += 1) layout.push(6)
+    const rows = []
+    let target = null
+    for (let i = 0; i < ROWS; i += 1) {
+      const turn = layout[i]
+      const lab = DOMKIT.el('span', {})
+      lab.textContent = '#' + turn
+      const user = i === 20
+      const attrs = {
+        'data-trajectory-row-key': encodeURIComponent(user ? 'user\u0000seq\u0000' + i : mod.__internals.trajStepKey(turn, i)),
+        'data-kind': user ? 'user' : 'message',
+      }
+      if (i === 0 || i === 10 || i === 20) attrs['data-turn-start'] = 'true'
+      const row = DOMKIT.el('tr', attrs, [lab])
+      rows.push(row)
+      if (user) target = row
+    }
+    const pane = DOMKIT.el('div', { 'data-trajectory-scroll': '' }, [])
+    pane.__rect = { top: 0, height: 300 }
+    pane.clientHeight = 300
+    pane.scrollHeight = ROWS * 30
+    const renderWindow = (st) => {
+      const win = []
+      rows.forEach((r, i) => {
+        const abs = i * 30
+        if (abs >= st - 150 && abs <= st + 450) {
+          r.__rect = { top: abs - st, height: 30 }
+          r.parentElement = pane
+          win.push(r)
+        }
+      })
+      pane.children = win
+    }
+    Object.defineProperty(pane, 'scrollTop', {
+      configurable: true,
+      get() { return pane.__st === undefined ? 0 : pane.__st },
+      set(v) { pane.__st = v; renderWindow(v) },
+    })
+    renderWindow(0)
+    const content = DOMKIT.el('div', { 'data-conversation-content': '' }, [DOMKIT.el('span', { 'data-turn': '6' }), pane])
+    withFakeDocument(content, () => mod.__internals.locateMainTurn('s', 6, undefined))
+    await sleepMs(2500)
+    ok('顺序乱了（6 排在 5、7 后面）也能兜底扫到并选中', target.__clicks === 1, target && target.__clicks)
+    mod.__internals.locateStop()
+  })()
+}
+
+// ───────────────────── ㊿ 断流自愈：SSE 断了要自己重连 ─────────────────────
+//
+// 用户："第二轮已经中断了，怎么还在运行"。查下来宿主那份是对的（新进程重折日志，
+// 那一步是 done）—— 是**面板这一侧的流早断了**：状态停在"等工具"那一刻，而秒表
+// 还在自己涨（看着像卡死）。原先 `onerror` 只把 connected 置 false 就等浏览器自己重试，
+// 服务端反复收流之后浏览器会放弃 —— 面板就永远不动了。
+console.log('\n㊿ 断流自愈（面板自己重连）')
+{
+  await (async () => {
+    resetMount()
+    render({ sessionId: 'sess-retry' })
+    lastEventSource.open()
+    const first = lastEventSource
+    first.onerror()
+    ok('断了先立刻标成断线（那一枚胶囊）', first.closed === true, first.closed)
+    await sleepMs(1200)
+    ok('1 秒后**自己重连**（换了一条新流，而不是干等浏览器）',
+      lastEventSource !== first && lastEventSource.closed === false, { same: lastEventSource === first })
+    const second = lastEventSource
+    second.onerror()
+    await sleepMs(1000)
+    ok('刚连上又断 → 退避拉长（不在 1 秒里反复打）', lastEventSource === second, lastEventSource === second)
+    await sleepMs(1400)
+    ok('退避到点后照样重连（没有卡死在第二次）', lastEventSource !== second, lastEventSource === second)
+    // 重连之后要能重新建结构：快照走一遍，轮次回来了
+    lastEventSource.emit({ t: 'snapshot', snapshot: { sessionId: 'sess-retry', serverTime: T0, known: true, state: 'live', turns: [], index: [] } })
+    ok('重连后能再收快照（结构重建，不抛）', lastEventSource.closed === false)
+    resetMount()
+  })()
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'}  ${pass} 通过 / ${fail} 失败\n`)

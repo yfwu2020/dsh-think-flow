@@ -40,7 +40,10 @@ import {
   applyStreamFrame,
   COMMAND_TOOLS,
   createTrace,
+  reasoningTokensOf,
   type StepFact,
+  textTokensOf,
+  tokenWeight,
   lastTurn,
   runningTool,
   stepElapsed,
@@ -71,7 +74,7 @@ export interface Config {
   /**
    * 目录索引里最多记多少轮（0 = 不限）。
    *
-   * 骨架很便宜（一轮几百字节：轮号/时间/用户消息/步数/字数），
+   * 骨架很便宜（一轮几百字节：轮号/时间/用户消息/步数/Token），
    * 所以这个上限只是防病态会话，默认给得很宽。
    */
   maxIndexTurns: number
@@ -117,6 +120,20 @@ export interface Config {
   /** 自动标题节拍器间隔（毫秒）。调小只为测试。 */
   autoTickMs: number
   /**
+   * 内存轨迹多久没收到实时动静就算"可疑"（毫秒）：到点且轨迹看着还在跑，就重折一遍日志。
+   * 也是重折**退避的基数**（15s → 30s → 60s…，封顶见 `resyncMaxGapMs`）。
+   */
+  resyncSilenceMs: number
+  /**
+   * 重折的退避上限（毫秒），也是这条自愈的总开关（`0` = 关掉）。
+   *
+   * ⚠️ 为什么是**退避**而不是"一段沉默期里最多折几次就彻底停手"：
+   *    本进程**不是**驱动者时（换个客户端接着看），实时事件永远不会来 ——
+   *    "沉默期"永远不会结束，一个硬上限就等于过一阵子**永久停止自愈**，
+   *    面板又会挂着一轮几小时前的"还在跑"（真机踩到过：硬上限那版 5 次之后就不再更正）。
+   */
+  resyncMaxGapMs: number
+  /**
    * 历史回看时最多折入多少条落盘事件（从最新往回取）。
    * 0 = 不限。大会话全量折入很慢，默认留一个上限。
    */
@@ -149,6 +166,13 @@ export const Config = z.object({
   titleReasoningEffort: z.string().default('low'),
   titleCachePath: z.string().default(''),
   autoTickMs: z.number().min(20).max(60_000).default(5000),
+  /**
+   * 内存轨迹多久没收到实时动静就算"可疑"（毫秒）—— 到了这个时间且轨迹看着还在跑，
+   * 就把日志重折一遍（见 `resyncFromLog`）。也是重折退避的基数。
+   */
+  resyncSilenceMs: z.number().min(20).max(600_000).default(15_000),
+  /** 重折退避的上限（毫秒；0 = 关掉这条自愈）。 */
+  resyncMaxGapMs: z.number().min(0).max(3_600_000).default(300_000),
   maxHydrateEvents: z.number().min(0).max(200000).default(20000),
   // 640 = 会话 LRU 上限 32 × 每会话轮数上限 20 —— 两个上限对齐，
   // 这样"还能在面板里翻到的轮"标题都不会被淘汰（实测 57 轮才 69KB，不差这点）
@@ -222,6 +246,15 @@ export type SessionState =
 export interface TurnSummary {
   readonly turn: number
   startedAt: number
+  /**
+   * 这一轮 `turn/start` 的**事件序号**：主会话"跳到某一轮"用的锚点
+   * （面板里点轮次号 → 客户端调 `session.loadThrough(seq)`）。
+   *
+   * ⚠️ 必须随**骨架**下发，不能只放在正文快照里：能跳的轮次恰恰常常是正文还没取回来的
+   * 那些（目录里点"更早的轮次"就是这种情况），只给正文那一份等于跳不了。
+   * 缺失（老日志 / hydrate 上限截断）时客户端退回"一页一页翻"的慢路。
+   */
+  seq?: number
   endedAt?: number
   endReason?: string
   interrupted?: boolean
@@ -239,10 +272,10 @@ export interface TurnSummary {
   steps: number
   /** 工具调用次数。 */
   tools: number
-  /** 思考原文总字数（正文丢了也保留这个数）。 */
-  reasoningChars: number
-  /** 正文总字数。 */
-  textChars: number
+  /** 思考原文总 **Token** 数（正文丢了也保留这个数）。 */
+  reasoningTokens: number
+  /** 正文总 **Token** 数。 */
+  textTokens: number
   /** 正文现在在内存里吗（false = 打开它时要现折）。 */
   inMemory: boolean
 }
@@ -272,6 +305,24 @@ interface SessionEntry {
    * 现算要把所有冷轮的每一步都过一遍 —— 那是每个事件一次的全量扫描。
    */
   coldChars: number
+  /**
+   * 本进程**最后一次亲眼看到**这个会话的实时动静是什么时候（流帧或会话事件都算）。
+   *
+   * 它是"这份内存轨迹还新不新"的唯一判据：本进程**不是**这个会话的驱动者时
+   *（换个客户端接着看 / 另一台进程在跑那一轮），实时事件根本不会到这儿来 ——
+   * 靠它才能认出"看着还在跑、其实早就结束了"。见 {@link maybeResync}。
+   */
+  lastLiveAt: number
+  /** 上一次强制重折的时间（节流用）。 */
+  resyncAt: number
+  /**
+   * 这一段"沉默期"里已经强制重折过几次。
+   *
+   * 为什么要退避：**真的**在等一个长工具时同样没有事件（实测有一次 `bash` 等了 59 分钟），
+   * 而那种沉默是正常的 —— 不能每 15 秒去重折一遍日志。所以按 2 的幂放大间隔，
+   * 一有实时事件就清零（说明本进程确实在驱动它，这段沉默结束了）。
+   */
+  resyncBurst: number
 }
 
 /** 内部诊断计数，`/ping` 用。 */
@@ -298,6 +349,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
     titleReasoningEffort: rawConfig?.titleReasoningEffort ?? 'low',
     titleCachePath: rawConfig?.titleCachePath ?? '',
     autoTickMs: rawConfig?.autoTickMs ?? 5000,
+    resyncSilenceMs: rawConfig?.resyncSilenceMs ?? 15_000,
+    resyncMaxGapMs: rawConfig?.resyncMaxGapMs ?? 300_000,
     maxHydrateEvents: rawConfig?.maxHydrateEvents ?? 20000,
     maxTitledTurns: rawConfig?.maxTitledTurns ?? 640,
   }
@@ -318,6 +371,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     e = {
       trace: createTrace(sessionId), subs: new Set(), state: 'live',
       index: new Map(), cold: new Map(), coldChars: 0,
+      lastLiveAt: now, resyncAt: 0, resyncBurst: 0,
     }
     sessions.set(sessionId, e)
     while (sessions.size > config.maxSessions) {
@@ -346,12 +400,12 @@ export function apply(ctx: Context, rawConfig: Config): void {
   /** 把一轮压成**骨架**：几百字节，不含正文。 */
   function summaryOf(sessionId: string, turn: TurnFact, inMemory: boolean): TurnSummary {
     let tools = 0
-    let reasoningChars = 0
-    let textChars = 0
+    let reasoningTokens = 0
+    let textTokens = 0
     for (const step of turn.steps) {
       tools += step.tools.length
-      reasoningChars += step.reasoning.length
-      textChars += step.text.length
+      reasoningTokens += reasoningTokensOf(step)
+      textTokens += textTokensOf(step)
     }
     // 轮次标题（模型生成的）：和 turnSnapshot 一样，**指纹对得上**才作数 ——
     // 这一轮的内容变了，旧标题就不该再跟着走
@@ -362,6 +416,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
     return {
       turn: turn.turn,
       startedAt: turn.startedAt,
+      // 事件序号（有就带上）：客户端"跳到某一轮"要它
+      ...(turn.seq !== undefined ? { seq: turn.seq } : {}),
       endedAt: turn.endedAt,
       endReason: turn.endReason,
       interrupted: turn.interrupted,
@@ -369,8 +425,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
       title,
       steps: turn.steps.length,
       tools,
-      reasoningChars,
-      textChars,
+      reasoningTokens,
+      textTokens,
       inMemory,
     }
   }
@@ -480,6 +536,9 @@ export function apply(ctx: Context, rawConfig: Config): void {
         const cap = config.maxReasoningCharsPerStep
         if (step.reasoning.length > cap) {
           step.reasoning = step.reasoning.slice(step.reasoning.length - cap)
+          // 截断了就按**留下**的那段重算 Token —— 面板报的数必须说的是
+          // "现在还能读到多少"，和截断前的旧数对不上就是两个真相。
+          step.reasoningWeight = tokenWeight(step.reasoning)
           step.streamGap = true          // 截断过，如实标记
         }
       }
@@ -593,6 +652,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     stats.frames += 1
     const e = entryOf(sessionId, Date.now())
     e.state = 'live'
+    markLive(e)
     whenNotHydrating(sessionId, () => {
       const changes = applyStreamFrame(e.trace, p.frame as never, Date.now())
       if (changes.length) broadcast(sessionId, changes)
@@ -605,6 +665,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     stats.events += 1
     const e = entryOf(sessionId, Date.now())
     e.state = 'live'
+    markLive(e)
     whenNotHydrating(sessionId, () => {
       // 实时会话也要记区间：没 hydrate 过的会话（正在跑的那个）搜索时同样要反查轮号
       const changes = applySessionEvent(e.trace, event as never, Date.now())
@@ -675,10 +736,36 @@ export function apply(ctx: Context, rawConfig: Config): void {
     else run()
   }
 
-  async function hydrate(sessionId: string): Promise<SessionState> {
+  /**
+   * 在飞的那一趟折历史（按会话）。
+   *
+   * ⚠️ **必须单飞**：并发的两次 `hydrate` 会各自 `hydrating.set(...)`（后一次把前一次的
+   *    排队表**覆盖**掉），然后各自 `e.trace.turns.length = 0` 用**自己那次读到的**日志
+   *    重建 —— 只要有一次读得早，它就会把后来的事实（轮结束、工具结果）整段抹掉，
+   *    而那次排队表已经没人认领、里面的实时事件**再也不会补放**。
+   *    表现：这一轮明明早就中断了，面板还一直挂着"已等 59'46""在跑，而且
+   *    **刷新页面也好不了**（内存里那份就是错的）。真机踩到过。
+   */
+  const hydratingRun = new Map<string, Promise<SessionState>>()
+
+  async function hydrate(sessionId: string, force = false): Promise<SessionState> {
+    const inflight = hydratingRun.get(sessionId)
+    if (inflight !== undefined) return inflight
+    const run = hydrateOnce(sessionId, force)
+    hydratingRun.set(sessionId, run)
+    const done = (): void => { hydratingRun.delete(sessionId) }
+    return run.then((state) => { done(); return state }, (error) => { done(); throw error })
+  }
+
+  /**
+   * 折一趟（强制时**重折**，把内存里那份换成日志里的事实）。
+   * @param force - 为 true 时无视"已经折过"的早退，重新读一遍日志。
+   */
+  async function hydrateOnce(sessionId: string, force: boolean): Promise<SessionState> {
     const existing = sessions.get(sessionId)
-    // 折过就早退（**不是**"有轮次就早退" —— 见 hydrated 的说明）
-    if (hydrated.has(sessionId)) return existing?.state ?? 'live'
+    // 折过就早退（**不是**"有轮次就早退" —— 见 hydrated 的说明）。
+    // `force` 是给"本进程不是驱动者"那条路用的：那份内存轨迹没人会来更正，只能自己重读。
+    if (!force && hydrated.has(sessionId)) return existing?.state ?? 'live'
     const persistence = persistenceOf()
     if (persistence?.open === undefined) return existing?.state ?? 'live'
 
@@ -723,6 +810,117 @@ export function apply(ctx: Context, rawConfig: Config): void {
       hydrating.delete(sessionId)
       for (const run of queued) run()
     }
+  }
+
+  // ───────────────────── 内存轨迹的"过期自愈"（重折日志） ─────────────────────
+
+  /** 记一笔"本进程刚看到这个会话的实时动静"。 */
+  function markLive(e: SessionEntry): void {
+    e.lastLiveAt = Date.now()
+    // 一有实时事件就说明本进程确实在驱动它 —— 这一段沉默结束了，重折额度重置
+    e.resyncBurst = 0
+  }
+
+  /**
+   * 这份轨迹"看着还在跑"吗 —— 有没结束的轮，而且它没有正在**流式**的步。
+   *
+   * ⚠️ 流式中的步要排除掉：那种步的思考文本还在**只存在于内存**（落盘要等这一步的
+   *    `assistant/message`），这时候重折会把它抹掉（面板上正在长的字突然没了）。
+   *    "等工具"（`waiting`）不一样：那一步的正文早就落盘了，重折是安全的。
+   */
+  function traceLooksOpen(trace: SessionTrace): boolean {
+    const open = trace.turns.filter((t) => t.endedAt === undefined)
+    if (open.length === 0) return false
+    for (const turn of open) {
+      for (const step of turn.steps) {
+        const status = stepStatus(step, turn)
+        if (status === 'thinking' || status === 'waiting') return true
+      }
+    }
+    return false
+  }
+
+  /** 距上一次重折至少要等多久（指数退避：15s → 30s → 60s…，封顶 `resyncMaxGapMs`）。 */
+  function resyncGap(e: SessionEntry): number {
+    return Math.min(config.resyncSilenceMs * Math.pow(2, e.resyncBurst), config.resyncMaxGapMs)
+  }
+
+  /** 该不该强制重折：看着还在跑 + 本进程好久没动静 + 距上次重折够久（退避）。 */
+  function needsResync(sessionId: string, now: number): boolean {
+    const e = sessions.get(sessionId)
+    if (e === undefined) return false
+    if (config.resyncMaxGapMs <= 0) return false
+    if (!traceLooksOpen(e.trace)) return false
+    if (now - e.lastLiveAt < config.resyncSilenceMs) return false
+    if (now - e.resyncAt < resyncGap(e)) return false
+    e.resyncAt = now
+    e.resyncBurst += 1
+    return true
+  }
+
+  /** 把当前快照推给这个会话的所有订阅者（重折之后对不上时用，客户端收到就整体替换）。 */
+  function pushSnapshot(sessionId: string): void {
+    const e = sessions.get(sessionId)
+    if (e === undefined || e.subs.size === 0) return
+    const snap = snapshot(sessionId)
+    for (const sub of e.subs) send(sub, { t: 'snapshot', snapshot: snap })
+  }
+
+  /** 轨迹的"形状指纹"：重折前后比一下，变了才推快照（没变就别惊动面板）。 */
+  function tracePrint(trace: SessionTrace): string {
+    const parts: string[] = []
+    for (const turn of trace.turns) {
+      parts.push(`${turn.turn}:${turn.endedAt ?? '-'}:${turn.steps.length}`)
+      for (const step of turn.steps) parts.push(`${step.step}/${stepStatus(step, turn)}`)
+    }
+    return parts.join('|')
+  }
+
+  /**
+   * **重折一遍日志**，把内存里那份"看着还在跑"的轨迹换成落盘的事实。
+   *
+   * 为什么需要它：本进程**不是**这个会话的驱动者时，实时事件根本不会到这儿来 ——
+   * 打开面板那一刻折出来的"还在跑"就再也没人更正。典型场景：
+   *   · 换了个客户端打开同一个会话（`dsh web` → 桌面版，或反过来）；
+   *   · 上一轮是在**另一个进程**里被打断的。
+   * 实测就是这样：那一轮 19:54 就中断了，21:53 面板还挂着"已等 59'46""，而且
+   * **刷新页面也好不了**（`hydrated` 早退了，内存那份永远不更新）。
+   *
+   * 代价有硬上限：只有"看着还在跑 + 沉默够久"才做，而且**退避**（15s → 30s → … → 5 分钟，
+   * 见 `resyncMaxGapMs`）—— 真的在等一个长工具时，几次之后就是 5 分钟才读一遍日志。
+   * @returns 这次是不是真的重折了。
+   */
+  function resyncFromLog(sessionId: string, now: number): boolean {
+    const e = sessions.get(sessionId)
+    if (e === undefined) return false
+    if (!needsResync(sessionId, now)) return false
+    const before = tracePrint(e.trace)
+    void hydrate(sessionId, true).then(() => {
+      const after = sessions.get(sessionId)
+      if (after === undefined) return
+      if (tracePrint(after.trace) === before) return
+      pushSnapshot(sessionId)
+    })
+    return true
+  }
+
+  /**
+   * 过期自愈的节拍器。
+   *
+   * 只在**有人开着这个会话的面板**时才算数（没人看就不用自愈，省 I/O）：
+   * 每次只做条件判断（没有任何 I/O），真重折由 `resyncFromLog` 的节流与额度管着。
+   * 间隔取 `resyncSilenceMs`（封顶 10 秒、下限 50ms，测试要能调快）。
+   */
+  const RESYNC_SWEEP_MS = Math.max(50, Math.min(config.resyncSilenceMs, 10_000))
+  if (config.resyncMaxGapMs > 0) {
+    const resyncTimer = setInterval(() => {
+      const now = Date.now()
+      for (const [sessionId, e] of sessions) {
+        if (e.subs.size === 0) continue
+        resyncFromLog(sessionId, now)
+      }
+    }, RESYNC_SWEEP_MS)
+    ctx.effect(() => () => { clearInterval(resyncTimer) }, `${name}: trace resync timer`)
   }
 
   // ───────────────────────── 中文标题（按需生成 + 落盘缓存） ─────────────────────────
@@ -806,7 +1004,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
    *
    * 注意它和 `titleInputsOf` 的口径不同：说明要翻成中文贴到**派生标题**后面，
    * 而派生标题是给**没有思考的步**用的 —— 所以这里不能按"有思考"过滤，
-   * 否则恰恰漏掉了最需要它的那些步（0 字的纯工具步）。
+   * 否则恰恰漏掉了最需要它的那些步（没有思考的纯工具步）。
    */
   function toolNotesOf(turn: TurnFact): TitleInputNote[] {
     const out: TitleInputNote[] = []
@@ -874,7 +1072,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
       steps.push({ step: s.step, reasoning: s.reasoning, tools: s.tools.map((t) => t.name) })
     }
     // 说明要翻成中文贴在**派生标题**后面，而派生标题是给"没有思考的步"用的 ——
-    // 所以这里不能按"有思考"过滤，否则恰恰漏掉最需要它的那些步（0 字的纯工具步）。
+    // 所以这里不能按"有思考"过滤，否则恰恰漏掉最需要它的那些步（没有思考的纯工具步）。
     for (const s of turn.steps) {
       for (const t of s.tools) {
         if (!COMMAND_TOOLS.has(t.name)) continue
@@ -1211,7 +1409,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
    *
    * 刻意**只给"当前步"附原文**：一个 turn 实测能有 7 万字思考，53 步全带原文的
    * 快照每次连接要传几 MB，而前端真正需要实时滚动观看的只有最后一步。
-   * 其余步骤只给字数与状态，用户展开时再走 `/step` 按需取。
+   * 其余步骤只给 Token 数与状态，用户展开时再走 `/step` 按需取。
    */
   /**
    * 一轮的**快照形状**。
@@ -1270,8 +1468,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
             step: step.step,
             status: stepStatus(step, turn),
             attempts: step.attempts,
-            reasoningChars: step.reasoning.length,
-            textChars: step.text.length,
+            reasoningTokens: reasoningTokensOf(step),
+            textTokens: textTokensOf(step),
             startedAt: step.startedAt,
             elapsedMs: stepElapsed(step, now),
             streamEndedAt: step.streamEndedAt,
@@ -1298,7 +1496,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
               // 翻译用的说明走 `turn.notes`（工具 id → 中文），那条才是客户端要的。
               startedAt: tool.startedAt,
               endedAt: tool.endedAt,
-              resultChars: tool.resultChars,
+              resultTokens: tool.resultTokens,
               // 失败态：只在真失败时下发（成功不带这个字段 —— 见 ToolFact.failed）。
               // 摘要已截到 200 字，一个失败的工具最多多占几百字节。
               ...(tool.failed !== undefined ? { failed: tool.failed } : {}),
@@ -1366,8 +1564,15 @@ export function apply(ctx: Context, rawConfig: Config): void {
   const handleStream = (req: IncomingMessage, res: ServerResponse): void => {
     const sessionId = query(req, 'session')
     if (sessionId === undefined) { json(res, 400, { ok: false, error: 'missing session' }); return }
-    // 打开面板时先补历史（旧会话内存里是空的），再接实时增量
-    void hydrate(sessionId)
+    // 打开面板时先补历史（旧会话内存里是空的），再接实时增量。
+    // ⚠️ 如果这份内存轨迹"看着还在跑、可本进程好久没动静"，先**重折一遍**再发快照 ——
+    //    不然打开面板看到的就是那份过期的"还在跑"（换个客户端打开同一会话时就是这样）。
+    const staleNow = Date.now()
+    if (needsResync(sessionId, staleNow)) {
+      void hydrate(sessionId, true)
+    } else {
+      void hydrate(sessionId)
+    }
 
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -1400,6 +1605,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
 
     // 先给一份快照，前端据此建结构；之后只收增量。
     // 放在 hydrate 之后发：旧会话要先把历史折进来，否则前端收到的是空快照。
+    // （`hydrate` 是单飞的：上面那次若已认领，这里等的是**同一趟**，不会多折一遍。）
     void hydrate(sessionId).then(() => {
       send(sub, { t: 'snapshot', snapshot: snapshot(sessionId) })
     })

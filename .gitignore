@@ -26,6 +26,13 @@ scripts/gen-*.mjs
 scripts/check-drive.mjs
 scripts/check-adjacent.mjs
 scripts/ring-glow-shared.mjs
+# 「呼吸环 → 鲸鱼尾巴」比选稿的配套：图形数据从宿主 app.asar 抽，夹具在本机
+scripts/whale-tail-shared.mjs
+scripts/extract-whale-tail.mjs
+# 「身体里的光效」「底部铺满光」比选稿 + 共用的取图器（产物都在 docs/ 下）
+scripts/body-light-shared.mjs
+scripts/bottom-light-shared.mjs
+scripts/docs-shots.mjs
 scripts/session-log.mjs
 scripts/title-probe.mjs
 scripts/cmd-title-probe.mjs

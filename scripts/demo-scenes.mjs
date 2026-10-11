@@ -24,7 +24,7 @@ export const SCENES = [
   {
     key: 'running',
     tag: '① 正在思考',
-    note: '模型正在写第 14 步。面板自动跟随到当前步；每行右侧容量条 = 那一步的思考字数；'
+    note: '模型正在写第 14 步。面板自动跟随到当前步；每行右侧容量条 = 那一步的思考 Token 数；'
       + '行里的中文标题是点「生成标题」后由模型一次调用生成的（结果由宿主落盘缓存）。',
     shot: { file: 'panel-running.png', theme: 'light', width: 420, maxHeight: 600 },
     html: ({ renderState, Body }) => renderState(Body, demoSnapshot({ upto: 14, lastStatus: 'thinking' })),

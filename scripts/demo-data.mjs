@@ -41,26 +41,26 @@ export const USER_TEXT = '订单列表页要能导出 CSV，字段跟表格列�
 export const TURN_TITLE = '加 CSV 导出并统一日期格式'
 
 /**
- * 步骤事实：[步号, 思考字数, 起始秒, 工具名数组]。
+ * 步骤事实：[步号, 思考 Token, 起始秒, 工具名数组]。
  *
  * 第 6 步两个 `read`（展示"相邻同名合并成 ×2"）、第 7 步三个 `edit`（×3）、
  * 第 12 步那次 `ask_user_question` 是**失败**的（展示失败态）。
  */
 const STEPS = [
-  [1, 1860, 0, ['bash']],
-  [2, 420, 6, ['read']],
-  [3, 1290, 11, ['bash']],
-  [4, 880, 18, ['grep']],
-  [5, 2140, 24, ['bash']],
-  [6, 660, 41, ['read', 'read']],
-  [7, 3010, 52, ['edit', 'edit', 'edit']],
-  [8, 1520, 79, ['web_search']],
-  [9, 2380, 96, ['write']],
-  [10, 940, 112, ['bash']],
-  [11, 1750, 121, ['edit']],
-  [12, 610, 133, ['ask_user_question']],
-  [13, 1980, 139, ['bash']],
-  [14, 2620, 158, ['bash']],
+  [1, 620, 0, ['bash']],
+  [2, 140, 6, ['read']],
+  [3, 430, 11, ['bash']],
+  [4, 290, 18, ['grep']],
+  [5, 710, 24, ['bash']],
+  [6, 220, 41, ['read', 'read']],
+  [7, 1000, 52, ['edit', 'edit', 'edit']],
+  [8, 510, 79, ['web_search']],
+  [9, 790, 96, ['write']],
+  [10, 310, 112, ['bash']],
+  [11, 580, 121, ['edit']],
+  [12, 200, 133, ['ask_user_question']],
+  [13, 660, 139, ['bash']],
+  [14, 870, 158, ['bash']],
 ]
 
 /** 模型生成的**步骤标题**（键 = 步号）。第 8、12 步故意不给：没有模型标题的步显示派生标题。 */
@@ -158,7 +158,7 @@ export function demoSnapshot(o = {}) {
         argsRaw: argsOf(n, step, i),
         startedAt: startedAt + 900,
         endedAt: running ? undefined : startedAt + 3800 + i * 600,
-        resultChars: 420 + ((step * 977 + i * 311) % 2600),
+        resultTokens: 140 + ((step * 977 + i * 311) % 870),
       }
       // 失败态：宿主折出来的是 `{ code, name, text }`，面板照抄
       if (step === failedStep && !isLast) {
@@ -171,8 +171,8 @@ export function demoSnapshot(o = {}) {
       step,
       status: isLast ? lastStatus : 'done',
       attempts: 1,
-      reasoningChars: len,
-      textChars: step === 14 ? 380 : 0,
+      reasoningTokens: len,
+      textTokens: step === 14 ? 220 : 0,
       startedAt,
       elapsedMs: endedAt === undefined ? undefined : endedAt - startedAt,
       endedAt,
@@ -221,17 +221,17 @@ export function demoSnapshot(o = {}) {
  */
 export function demoOlderTurns() {
   const older = [
-    [11, '分页跳号修一下，第 2 页开始重复第一页的数据', '修分页跳号', 7, 9, 9120],
-    [10, '把日期格式统一成 yyyy-MM-dd', '统一日期格式', 5, 4, 6180],
-    [9, '订单筛选加个"仅看已付款"', '加已付款筛选', 9, 12, 14200],
-    [8, '列表加载慢，看看能不能加个骨架屏', '加列表骨架屏', 6, 5, 7340],
-    [7, '导出按钮的图标换成下载箭头', '换导出图标', 3, 2, 2260],
-    [6, '这页的表格列宽在窄屏下挤在一起', '修窄屏列宽', 8, 6, 10480],
-    [5, '给订单接口加个超时重试', '加超时重试', 11, 14, 18760],
-    [4, '把 mock 数据挪到 fixtures 目录', '挪 mock 数据', 4, 6, 4980],
-    [3, '跑一遍 lint 看看有多少告警', '跑 lint', 2, 3, 1640],
-    [2, '帮我看看这个项目用什么测试框架', '看测试框架', 3, 4, 3120],
-    [1, '这个后台的订单页在哪', '找订单页', 2, 2, 1180],
+    [11, '分页跳号修一下，第 2 页开始重复第一页的数据', '修分页跳号', 7, 9, 3040],
+    [10, '把日期格式统一成 yyyy-MM-dd', '统一日期格式', 5, 4, 2060],
+    [9, '订单筛选加个"仅看已付款"', '加已付款筛选', 9, 12, 4730],
+    [8, '列表加载慢，看看能不能加个骨架屏', '加列表骨架屏', 6, 5, 2450],
+    [7, '导出按钮的图标换成下载箭头', '换导出图标', 3, 2, 750],
+    [6, '这页的表格列宽在窄屏下挤在一起', '修窄屏列宽', 8, 6, 3490],
+    [5, '给订单接口加个超时重试', '加超时重试', 11, 14, 6250],
+    [4, '把 mock 数据挪到 fixtures 目录', '挪 mock 数据', 4, 6, 1660],
+    [3, '跑一遍 lint 看看有多少告警', '跑 lint', 2, 3, 550],
+    [2, '帮我看看这个项目用什么测试框架', '看测试框架', 3, 4, 1040],
+    [1, '这个后台的订单页在哪', '找订单页', 2, 2, 390],
   ]
   return older.map(([turn, userText, title, stepCount, toolCount, chars]) => ({
     turn,
@@ -243,12 +243,12 @@ export function demoOlderTurns() {
       step: i + 1,
       status: 'done',
       attempts: 1,
-      reasoningChars: Math.round(chars / stepCount),
-      textChars: 0,
+      reasoningTokens: Math.round(chars / stepCount),
+      textTokens: 0,
       startedAt: T0 - (FEATURED_TURN - turn) * 900000 + i * 12000,
       elapsedMs: 3200 + ((i * 617) % 4100),
       tools: i % 3 === 0
-        ? [{ id: `h${turn}_${i}`, name: 'bash', argsRaw: JSON.stringify({ command: 'npm test' }), startedAt: T0, endedAt: T0 + 1200, resultChars: 900 }]
+        ? [{ id: `h${turn}_${i}`, name: 'bash', argsRaw: JSON.stringify({ command: 'npm test' }), startedAt: T0, endedAt: T0 + 1200, resultTokens: 300 }]
         : [],
     })),
   }))
@@ -260,16 +260,16 @@ export function demoOlderTurns() {
  */
 export function demoTurnIndex() {
   const rows = [
-    [FEATURED_TURN, USER_TEXT, TURN_TITLE, 14, 15, 24980, 380, true],
+    [FEATURED_TURN, USER_TEXT, TURN_TITLE, 14, 15, 7350, 220, true],
   ]
   for (const t of demoOlderTurns()) {
-    const chars = t.steps.reduce((n, s) => n + s.reasoningChars, 0)
-    rows.push([t.turn, t.userText, t.title, t.steps.length, t.steps.filter((s) => s.tools.length).length, chars, 0, true])
+    const tokens = t.steps.reduce((n, s) => n + s.reasoningTokens, 0)
+    rows.push([t.turn, t.userText, t.title, t.steps.length, t.steps.filter((s) => s.tools.length).length, tokens, 0, true])
   }
-  return rows.map(([turn, userText, title, steps, tools, reasoningChars, textChars, inMemory]) => ({
+  return rows.map(([turn, userText, title, steps, tools, reasoningTokens, textTokens, inMemory]) => ({
     turn, startedAt: T0 - (FEATURED_TURN - turn) * 900000,
     endedAt: T0 - (FEATURED_TURN - turn) * 900000 + 240000,
-    userText, title, steps, tools, reasoningChars, textChars, inMemory,
+    userText, title, steps, tools, reasoningTokens, textTokens, inMemory,
   }))
 }
 
