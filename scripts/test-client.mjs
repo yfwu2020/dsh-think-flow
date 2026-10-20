@@ -4979,6 +4979,7 @@ console.log('\n㊿+ 机翻：段落切法')
 
   const css = String(mod.__internals.CSS)
   ok('实时态是实心蓝 + 呼吸（不是只靠呼吸区分）', css.includes('.tf-zh.is-live{') && css.includes('tf-zh-breathe'))
+  ok('翻译失败不挂红圈（用户要求：失败静默）', !css.includes('.tf-zh.is-err'))
   ok('呼吸尊重 reduced-motion', css.replace(/\s+/g, '').includes('@media(prefers-reduced-motion:reduce){.tf-zh.is-live{animation:none}}'))
 
   T.pref = 'demand'

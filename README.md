@@ -7,7 +7,7 @@
 [![release](https://img.shields.io/github/v/release/yfwu2020/dsh-think-flow?label=release)](https://github.com/yfwu2020/dsh-think-flow/releases)
 [![npm](https://img.shields.io/npm/v/@yfwu2020/dsh-think-flow?label=npm)](https://www.npmjs.com/package/@yfwu2020/dsh-think-flow)
 [![license](https://img.shields.io/badge/license-MIT-green)](./package.json)
-[![tests](https://img.shields.io/badge/tests-1292%20assertions-brightgreen)](./scripts)
+[![tests](https://img.shields.io/badge/tests-1293%20assertions-brightgreen)](./scripts)
 [![DSH plugin](https://img.shields.io/badge/DSH-plugin-8b5cf6)](https://github.com/yfwu2020/dsh-think-flow)
 
 ---
@@ -88,7 +88,7 @@
 dsh plugin --profile web add @yfwu2020/dsh-think-flow
 
 # 或从 GitHub Release 的 tgz（同一个产物，不走 npm）
-dsh plugin --profile web add /path/to/yfwu2020-dsh-think-flow-0.3.0.tgz
+dsh plugin --profile web add /path/to/yfwu2020-dsh-think-flow-0.3.1.tgz
 
 # 或从本地目录（开发用：改完不用重装，只重建）
 dsh plugin --profile web add link:/path/to/dsh-think-flow

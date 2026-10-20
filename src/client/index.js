@@ -1683,7 +1683,8 @@ window.__ModuleLoader__.load({
       /*
        * 「中文」机翻开关：几何抄「实时」那一枚，开着的颜色换成**业务蓝**
        * （绿色已经被"实时标题"占了，两枚绿胶囊并排会读成同一个控件的两半）。
-       * `is-busy` 表示还有段落正在翻；`is-err` 表示有过失败（点两下重试）。
+       * 失败不做任何视觉标记（用户要求）：失败段落静默保留英文，
+       * 点一下换状态会顺带重试。
        */
       '.tf-zh{border:1px solid var(--dsw-alias-border-l2);border-radius:999px;background:none;padding:2px 9px;font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-tertiary);cursor:pointer;flex:0 0 auto;transition:background .15s,color .15s,border-color .15s}',
       '.tf-zh:not(.is-on):hover:not(:disabled){color:var(--dsw-alias-label-secondary)}',
@@ -1699,7 +1700,6 @@ window.__ModuleLoader__.load({
       '.tf-zh.is-on{background:var(--dsw-alias-state-business-tertiary);color:var(--dsw-alias-state-business-primary);border-color:var(--dsw-alias-state-business-primary);font-weight:600}',
       '.tf-zh.is-live{background:var(--dsw-alias-state-business-primary);color:#fff;border-color:var(--dsw-alias-state-business-primary);font-weight:600;animation:tf-zh-breathe 2.8s ease-in-out infinite}',
       '@keyframes tf-zh-breathe{0%,100%{opacity:1}50%{opacity:.72}}',
-      '.tf-zh.is-err{box-shadow:0 0 0 1px var(--dsw-alias-state-error-primary)}',
       '.tf-zh:disabled{opacity:.4;cursor:default}',
       '.tf-zh:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}',
       '@media (prefers-reduced-motion: reduce){.tf-zh.is-live{animation:none}}',
@@ -4318,22 +4318,18 @@ window.__ModuleLoader__.load({
            */
           React.createElement('button', {
             className: 'tf-zh' + (tlEnabled() ? ' is-on' : '')
-              + (tlMode() === 'live' ? ' is-live' : '')
-              + (tlStore.failed.size > 0 ? ' is-err' : ''),
+              + (tlMode() === 'live' ? ' is-live' : ''),
             key: 'zh',
             'aria-label': '中文翻译：' + (tlMode() === 'live' ? '实时' : tlMode() === 'demand' ? '开，按需' : '关'),
             'aria-pressed': tlEnabled() ? 'true' : 'false',
             disabled: !tlStore.available,
             title: !tlStore.available
               ? '中文翻译：不可用 —— 需要官方 translator 插件（@deepseek-ai/dsh-experimental-translator），装好后刷新页面'
-              : tlStore.failed.size > 0
-                ? '中文翻译：' + (tlMode() === 'live' ? '实时' : tlMode() === 'demand' ? '开（按需）' : '关')
-                  + ' · 有段落翻译失败，点一下换个状态会重试'
-                : tlMode() === 'live'
-                  ? '中文翻译：实时 —— 流式输出时边写边翻。点一下关闭'
-                  : tlMode() === 'demand'
-                    ? '中文翻译：开（按需）—— 只在展开某一步时翻译。点一下切到实时'
-                    : '中文翻译：关。点一下开启（只在展开某一步时翻译）',
+              : tlMode() === 'live'
+                ? '中文翻译：实时 —— 流式输出时边写边翻。点一下关闭'
+                : tlMode() === 'demand'
+                  ? '中文翻译：开（按需）—— 只在展开某一步时翻译。点一下切到实时'
+                  : '中文翻译：关。点一下开启（只在展开某一步时翻译）',
             onClick: function () {
               if (!tlStore.available) return
               tlCycleMode()
