@@ -149,9 +149,25 @@ async function main() {
   // 组件里的秒表用 setInterval；截图是静态的，别让它把进程挂住
   globalThis.setInterval = () => 0
   globalThis.clearInterval = () => {}
-  globalThis.fetch = () => Promise.resolve({
-    ok: true, json: () => Promise.resolve({ reasoning: STEP_STUB, streamGap: false }),
-  })
+  /**
+   * `/ping` / `/translate` / `/step` 三个桩。
+   *
+   * · `/ping` 说"翻译服务可用"——否则头部那枚「中文」开关会画成**禁用**灰，
+   *   而真机上它是开着的（默认开）；
+   * · `/translate` 原样回一句中文（演示数据本来就是中文，正常不会走到这里，
+   *   留着是防以后换成英文演示数据时页面冒"翻译失败"）；
+   * · 其余（`/step`）返回演示原文。
+   */
+  globalThis.fetch = (url) => {
+    const u = String(url)
+    if (u.includes('/ping')) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ translate: { available: true, target: 'zh-CN', maxChars: 3600 } }) })
+    }
+    if (u.includes('/translate')) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true, text: '' }) })
+    }
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ reasoning: STEP_STUB, streamGap: false }) })
+  }
 
   /**
    * ⚠️ 每个场景都要**重新装一次底座**（`createHarness()` 会重新求值一遍 bundle）。
@@ -162,6 +178,13 @@ async function main() {
    */
   const fresh = () => {
     const h = createHarness()
+    // 预览环境没有浏览器自带的 fetch：把上面的桩挂到 window 上，
+    // 面板的 `/ping` 探测（机翻开关）才会真的问一次。
+    globalThis.window.fetch = globalThis.fetch
+    // 截图是**静态**的：effect 里那次异步 `/ping` 回来时不会再渲染一遍。
+    // 直接告诉面板"服务可用"，否则头部「中文」会画成禁用灰（真机是开着的）。
+    const tl = h.mod.__internals && h.mod.__internals.translateState
+    if (tl) { tl.available = true; tl.checked = true; tl.pref = 'live' }
     const slots = collectSlots(h.mod)
     if (!slots.Body) {
       console.error('没能拿到标签页 body 组件 —— 先 `npm run build`。')

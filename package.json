@@ -1,6 +1,6 @@
 {
   "name": "@yfwu2020/dsh-think-flow",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DSH 思维链可视化：把模型的实时思考按 turn → step →（思考原文 + 工具调用）聚合成可读的右侧栏视图",
   "type": "module",
   "main": "./lib/index.js",
@@ -43,6 +43,7 @@
     "scripts/test-titles.mjs",
     "scripts/test-routes.mjs",
     "scripts/test-client.mjs",
+    "scripts/test-translate.mjs",
     "scripts/check-align.mjs"
   ],
   "peerDependencies": {
@@ -66,10 +67,11 @@
     "build": "bash scripts/build.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint:templates": "node scripts/lint-templates.mjs",
-    "test": "npm run lint:templates && npm run typecheck && node scripts/test-trace.mjs && node scripts/test-titles.mjs && node scripts/test-routes.mjs && node scripts/test-client.mjs",
+    "test": "npm run lint:templates && npm run typecheck && node scripts/test-trace.mjs && node scripts/test-titles.mjs && node scripts/test-routes.mjs && node scripts/test-translate.mjs && node scripts/test-client.mjs",
     "test:trace": "node scripts/test-trace.mjs",
     "test:titles": "node scripts/test-titles.mjs",
     "test:routes": "node scripts/test-routes.mjs",
+    "test:translate": "node scripts/test-translate.mjs",
     "test:client": "node scripts/test-client.mjs",
     "preview": "node scripts/gen-ui-preview.mjs",
     "shots": "node scripts/gen-readme-shots.mjs",

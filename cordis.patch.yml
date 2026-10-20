@@ -23,6 +23,11 @@
 #                               实测 reasoning 每秒几百个事件，逐事件推会把浏览器刷死
 #   heartbeatMs                 SSE 心跳（默认 15000ms）
 #   snapshotTailChars           连接快照里给"当前步"带多少字符原文（默认 4000）
+#   translateTarget             思考原文机翻的目标语言（默认 zh-CN）。要宿主装了
+#                               @deepseek-ai/dsh-experimental-translator 才生效
+#   translateProvider           机翻提供方（默认 '' = 跟随 translator 自身配置，bing）
+#   translateMaxChars           单段翻译的字符上限（默认 3600）
+#   translateCachePath          译文缓存路径（默认 ~/.dsh/think-flow/translations.json）
 - insert:
     - id: think-flow
       name: '@yfwu2020/dsh-think-flow'

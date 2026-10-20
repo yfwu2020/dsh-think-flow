@@ -59,6 +59,7 @@ function boot(config, opts = {}) {
     get(name) {
       if (name === 'llm') return opts.llm
       if (name === 'agentDefaultModel') return opts.model
+      if (name === 'translator') return opts.translator
       if (name === 'sessionPersistence') return opts.persistence
       if (name === 'sessionQuery') return opts.sessionQuery
       return undefined
@@ -115,12 +116,21 @@ function fakeRes() {
 }
 
 /** 假 req。 */
-function fakeReq(url) {
+function fakeReq(url, method) {
   const handlers = {}
   return {
+    method: method || 'GET',
     url,
-    on(ev, fn) { handlers[ev] = fn },
-    close() { handlers['close'] && handlers['close']() },
+    on(ev, fn) {
+      const arr = handlers[ev] ?? (handlers[ev] = [])
+      arr.push(fn)
+      return this
+    },
+    close() { for (const fn of handlers['close'] ?? []) fn() },
+    /** 把一段请求体喂进去（`/translate` 是 POST + JSON）。 */
+    feed(text) { for (const fn of handlers['data'] ?? []) fn(Buffer.from(text, 'utf8')) },
+    /** 请求体结束。 */
+    endBody() { for (const fn of handlers['end'] ?? []) fn() },
   }
 }
 
@@ -184,10 +194,10 @@ function okResult(time, callId, text, turn = 1, step = 1) {
 console.log('\n① 路由注册')
 {
   const app = boot()
-  for (const p of ['stream', 'trace', 'step', 'turn', 'sessions', 'titles', 'ping']) {
+  for (const p of ['stream', 'trace', 'step', 'turn', 'sessions', 'titles', 'auto', 'translate', 'ping']) {
     ok(`注册了 ${API}/${p}`, app.routes.has(`${API}/${p}`))
   }
-  ok('共 8 条路由', app.routes.size === 8, app.routes.size)
+  ok('共 9 条路由', app.routes.size === 9, app.routes.size)
 }
 
 // ───────────────────── ② /ping ─────────────────────
@@ -1233,6 +1243,83 @@ console.log('\n㊿ 过期自愈（单飞折历史 + 沉默够久重折日志）'
   ok('重折之后那一轮变成"已结束"（面板不再谎报在跑）', last.endedAt !== undefined, last.endedAt)
   ok('那一步的工具也结束了', last.steps[0].tools[0].endedAt !== undefined, last.steps[0].tools)
   sreq.close()
+}
+
+// ───────────────────── ㊿+ 思考原文机翻（/translate） ─────────────────────
+//
+// 翻译本身交给官方 experimental translator（`ctx.translator`）。这里用桩服务
+// 把**本插件负责的那一层**固定下来：不可用时 503、同一段只翻一次、
+// 超长拒绝、并发合并 —— 以及 /ping 里 `translate.available` 的口径
+// （面板靠它决定「中文」开关能不能点）。
+console.log('\n㊿+ 思考原文机翻（/translate）')
+{
+  /** 发一次 POST /translate，返回假 res。 */
+  async function postTranslate(app, payload) {
+    const req = fakeReq(`${API}/translate`, 'POST')
+    const res = fakeRes()
+    const run = app.handler(`${API}/translate`)(req, res)
+    req.feed(typeof payload === 'string' ? payload : JSON.stringify(payload))
+    req.endBody()
+    await run
+    return res
+  }
+
+  // ① 没装 translator：503 + /ping 说不可用（面板把开关禁用，而不是点了没反应）
+  const bare = boot()
+  const barePing = fakeRes()
+  bare.handler(`${API}/ping`)(fakeReq(`${API}/ping`), barePing)
+  const bareBody = barePing.json()
+  ok('/ping 报告翻译不可用', bareBody.translate && bareBody.translate.available === false, bareBody.translate)
+  const offRes = await postTranslate(bare, { text: 'hello' })
+  ok('没有 translator → 503', offRes.status === 503, offRes.status)
+  ok('503 说清原因（不是一句 failed）', offRes.json().error === 'translator-unavailable', offRes.json())
+
+  // ② 有 translator：翻译、缓存、上限、并发合并
+  let calls = 0
+  const translator = {
+    maxTextChars: 4000,
+    resolve(request) { return { ...request, provider: 'bing' } },
+    async translate(spec) {
+      calls += 1
+      await new Promise((r) => setTimeout(r, 5))
+      return '译文：' + spec.text
+    },
+  }
+  const app = boot({ translateCachePath: join(TMP_DIR, 'tr-' + Date.now() + '.json') }, { translator })
+
+  const okRes = await postTranslate(app, { text: 'first paragraph' })
+  ok('翻好返回 200', okRes.status === 200, okRes.status)
+  ok('译文原样带回（面板拿它替换原文）', okRes.json().text === '译文：first paragraph', okRes.json())
+  ok('第一次走网络（cached=false）', okRes.json().cached === false, okRes.json())
+
+  const again = await postTranslate(app, { text: 'first paragraph' })
+  ok('同一段第二次命中缓存（不再发请求）', again.json().cached === true && calls === 1, { calls, body: again.json() })
+  ok('缓存命中不碰网络', again.json().text === '译文：first paragraph')
+
+  const ping = fakeRes()
+  app.handler(`${API}/ping`)(fakeReq(`${API}/ping`), ping)
+  const pingBody = ping.json()
+  ok('/ping 报告可用 + 目标语言', pingBody.translate.available === true && pingBody.translate.target === 'zh-CN', pingBody.translate)
+  ok('/ping 给出单段上限（取两者较小值）', pingBody.translate.maxChars === 3600, pingBody.translate.maxChars)
+
+  const tooLong = await postTranslate(app, { text: 'x'.repeat(4000) })
+  ok('超过单段上限 → 413（不截断）', tooLong.status === 413, tooLong.status)
+
+  const blank = await postTranslate(app, { text: '   ' })
+  ok('空白直接回空（不发请求）', blank.status === 200 && blank.json().text === '' && calls === 1, blank.json())
+
+  const getRes = fakeRes()
+  const getReq = fakeReq(`${API}/translate`, 'GET')
+  await app.handler(`${API}/translate`)(getReq, getRes)
+  ok('GET 拒绝（只有 POST）', getRes.status === 405, getRes.status)
+
+  const bad = await postTranslate(app, '{not json')
+  ok('坏 JSON → 400', bad.status === 400, bad.status)
+
+  // 并发：同一段同时在飞时只发一次网络请求（面板重渲染会重复问）
+  const before = calls
+  await Promise.all([postTranslate(app, { text: 'same concurrent' }), postTranslate(app, { text: 'same concurrent' })])
+  ok('同一段并发请求合并成一次', calls === before + 1, { before, calls })
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'}  ${pass} 通过 / ${fail} 失败\n`)

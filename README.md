@@ -7,7 +7,7 @@
 [![release](https://img.shields.io/github/v/release/yfwu2020/dsh-think-flow?label=release)](https://github.com/yfwu2020/dsh-think-flow/releases)
 [![npm](https://img.shields.io/npm/v/@yfwu2020/dsh-think-flow?label=npm)](https://www.npmjs.com/package/@yfwu2020/dsh-think-flow)
 [![license](https://img.shields.io/badge/license-MIT-green)](./package.json)
-[![tests](https://img.shields.io/badge/tests-1124%20assertions-brightgreen)](./scripts)
+[![tests](https://img.shields.io/badge/tests-1292%20assertions-brightgreen)](./scripts)
 [![DSH plugin](https://img.shields.io/badge/DSH-plugin-8b5cf6)](https://github.com/yfwu2020/dsh-think-flow)
 
 ---
@@ -26,7 +26,7 @@
 | 一个 turn 的思考量 | **7.1 万字** |
 | 一个 turn 的工具调用 | **68 次** |
 
-所以这个面板做了四件事，每一件都对应上面某个数字：
+所以这个面板做了五件事，每一件都对应上面某个数字：
 
 - **按 step 聚合，不逐字渲染**。reasoning 每秒几百个事件，逐事件重绘会把面板刷成幻灯片。
   宿主侧按 step 折叠 + **120ms 合并推送**（`sseThrottleMs`）。
@@ -38,6 +38,8 @@
   不画出来，界面在这 47 秒里与卡死无法区分。
 - **轮次可回溯**。正文只常驻最近 20 轮，更早的走**全轮目录**按需折回来；
   翻到 100 轮之前也不用把它全塞进内存。
+- **思考可以变中文**。英文 CoT 按段落机翻（官方 translator 服务，Bing/Google 匿名端点），
+  翻好一段显示一段；关掉就是原文。见 [中文思考（机翻）](#中文思考机翻)。
 
 ## 长什么样
 
@@ -86,7 +88,7 @@
 dsh plugin --profile web add @yfwu2020/dsh-think-flow
 
 # 或从 GitHub Release 的 tgz（同一个产物，不走 npm）
-dsh plugin --profile web add /path/to/yfwu2020-dsh-think-flow-0.2.0.tgz
+dsh plugin --profile web add /path/to/yfwu2020-dsh-think-flow-0.3.0.tgz
 
 # 或从本地目录（开发用：改完不用重装，只重建）
 dsh plugin --profile web add link:/path/to/dsh-think-flow
@@ -141,6 +143,12 @@ dsh plugin --profile web add link:/path/to/dsh-think-flow
 | `autoTickMs` | `5000` | 20–60000 | 自动标题（面板上的「实时」）的节拍器间隔 |
 | `maxHydrateEvents` | `20000` | 0–200000 | 历史回看时最多折入多少条落盘事件（从最新往回取） |
 | `maxTitledTurns` | `640` | 0–10000 | 标题缓存最多保留多少轮 |
+| `translateTarget` | `'zh-CN'` | — | 思考原文机翻的目标语言 |
+| `translateProvider` | `''` | — | 机翻提供方（`bing` / `google`）。空 = 跟随 translator 服务自身的配置（默认 bing）。付费路由要写会话日志，本插件对会话只读，**别用** |
+| `translateMaxChars` | `3600` | 200–4000 | 单个翻译请求的字符上限（再和 translator 的 `maxTextChars` 取小） |
+| `translateTimeoutMs` | `20000` | 1000–120000 | 单次翻译请求超时 |
+| `translateCachePath` | `''` | — | 译文缓存路径。空 = `~/.dsh/think-flow/translations.json` |
+| `maxTranslationEntries` | `4000` | 0–100000 | 译文缓存最多保留多少条（一段一条，LRU） |
 
 **三条策略要一起看**（它们管的是同一块内存）：
 
@@ -157,13 +165,51 @@ index（全轮骨架）    maxIndexTurns = 2000      ← 目录读它；正文�
 
 **清理全是自动的，没有手动入口**（要手动只能删文件或重启进程）。除上面那些，
 还有两处硬编码上限：`trace.attempts` 是 128 条 FIFO；订阅者的增量队列由节流窗口清空。
-另外**卸载插件不会删** `~/.dsh/think-flow/`（标题缓存留着，重装即复用）。
+另外**卸载插件不会删** `~/.dsh/think-flow/`（标题缓存与译文缓存留着，重装即复用）。
+
+## 中文思考（机翻）
+
+模型的思考原文是英文。面板头部那枚「**中文**」按钮把它按**段落**翻成中文。
+按钮上永远只有两个字，状态靠**亮 / 呼吸**区分（点一下依次是 **关 → 开 → 实时 → 关**，
+选择记在浏览器里；鼠标悬停会说明"现在是什么状态、点一下会发生什么"）：
+
+| 状态 | 按钮长相 | 行为 |
+| --- | --- | --- |
+| **实时**（默认） | `中文`：实心蓝 + 呼吸 | 边流边翻：折叠态那条实时流也翻，翻好一段显示一段 |
+| **开** | `中文`：常亮淡蓝 | 流式输出时**一个字都不翻**；只有你**展开某一步**时才翻这一步 |
+| **关** | `中文`：不亮 | 原文，一个请求都不发 |
+
+> 呼吸只用来提示"实时"。系统开了「减少动态效果」时呼吸会停，但实时态仍是**实心蓝**，
+> 和「开」的淡蓝分得开 —— 状态不依赖动画存在。
+
+- **翻译不花模型调用**。走的是官方的 translator 服务（Bing / Google 匿名端点），
+  和宿主里那个 `@deepseek-ai/dsh-experimental-cot-translation-bundle` 是同一个底座。
+- **翻好一段显示一段**。整段思考不会等翻完才出现：已定型的段落显示译文，
+  正在流式增长的那一段先显示原文，段落一停就补翻。
+- **只翻看得见的字**。宿主不主动翻整轮思考 —— 一次 turn 实测 7 万字，全翻是上百次
+  网络请求；「开」模式下更是只有你点开的那一步会翻。
+- **本来就是中文的段落不送翻**（避免"中文翻中文"）。
+- **原文永远在**：切到「关」立刻回到英文原文，会话日志一个字节都没改。
+
+> 🔒 翻译意味着**把段落发给第三方**（Bing / Google 的匿名翻译端点）。不想外发就切到
+> 「关」—— 之后面板一个翻译请求都不发，宿主也不会主动翻任何东西。
+
+> ⚠️ 需要宿主装 **`@deepseek-ai/dsh-experimental-translator`**（装
+> `@deepseek-ai/dsh-experimental-cot-translation-bundle` 就会带上它）。
+> 没装时开关**禁用并给出原因**，插件其余功能完全不受影响。
+
+译文缓存两层的上限都是硬的：**浏览器内存 3000 段**（LRU，页面刷新即清空）、
+**宿主内存/磁盘 4000 段**（`maxTranslationEntries`，落盘到
+`~/.dsh/think-flow/translations.json`，约 1MB 量级）。越界按最近使用淘汰；
+被淘汰的段落下次显示时重新翻（宿主磁盘里还有的话直接命中，不走网络）。
+卸载插件不会删缓存文件。
 
 ## 面板怎么用
 
 | 想干的事 | 怎么做 |
 | --- | --- |
 | 看结构 / 看原文 | 头部 `看结构 \| 看原文` 切换。**实时默认「看原文」**，切过去就展开本轮 |
+| 思考变中文 | 头部「中文」按钮：不亮 = 关；常亮 = 开（只在展开某一步时翻）；常亮 + 呼吸 = 实时（边写边翻）。悬停看当前状态。见上一节 |
 | 展开某一步 | 点行尾的 `▸`。展开区依次是：次级标题（派生标题）、工具详情、思考原文（以及回答正文） |
 | 看某一步在等什么 | 悬停那一步 —— 悬停里给全工具体、机读码、失败原因 |
 | 回到更早的轮次 | **双击第二行标题**进目录；或点轮号两侧的 `‹ ›` 走相邻轮 |

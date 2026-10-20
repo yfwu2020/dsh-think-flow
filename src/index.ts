@@ -10,8 +10,13 @@
  *   · 历史回看 —— 内存里没有的会话，从落盘日志折出来（`hydrate`），使旧会话也能读
  *   · 中文标题 —— 按需调用模型把整轮思考压成中文短标题，结果落盘缓存（`/titles`）
  *
- * 唯一落盘的东西是**标题缓存**（派生数据，丢了随时能重算）；会话本身只读、不改。
- * 除了"生成标题"这一次显式动作，插件不主动调用模型。
+ * 还有一条**可选**能力：
+ *   · 思考原文机翻（`/translate`）—— 面板按段落送翻，宿主转给官方的
+ *     `@deepseek-ai/dsh-experimental-translator`（Bing/Google 匿名端点）。
+ *     没装那个 bundle 时接口返回 503，面板把「中文」开关禁用，其余功能照常。
+ *
+ * 唯一落盘的东西是**标题缓存**与**译文缓存**（都是派生数据，丢了随时能重算）；
+ * 会话本身只读、不改。除了"生成标题"这一次显式动作，插件不主动调用模型。
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
@@ -35,6 +40,7 @@ import {
   type TitleInputNote,
   type TitleInputStep,
 } from './titles.js'
+import { TranslationCache, translationKey, type TranslatorLike } from './translate.js'
 import {
   applySessionEvent,
   applyStreamFrame,
@@ -148,6 +154,40 @@ export interface Config {
    * 和该轮所有工具说明的翻译）。
    */
   maxTitledTurns: number
+  /**
+   * 思考原文机翻的**目标语言**（默认简体中文）。
+   *
+   * 翻译走官方 `@deepseek-ai/dsh-experimental-translator`（`ctx.translator`）。
+   * 没装那个 bundle 的 profile 里本项无效，面板上的「中文」开关自动禁用。
+   */
+  translateTarget: string
+  /**
+   * 机翻**提供方**：`bing` / `google` / `deepseek-account` / `deepseek-official`。
+   *
+   * `''` = 跟随 translator 服务自身的配置（默认 `bing`，匿名端点、不需要 key）。
+   * 付费路由要求会话持久化，而本插件对会话只读、不传 sessionId ——
+   * 所以这里**只建议用 bing / google**（付费路由会因为缺 session 直接报错）。
+   */
+  translateProvider: string
+  /**
+   * 单个翻译请求的**字符上限**。
+   *
+   * 客户端按段落切、每段不超过它；宿主还会再和 translator 的 `maxTextChars`
+   * 取一次较小值（Bing/Google 默认 4000）。超出直接 413，不截断 ——
+   * 截断会把一句话翻成半句，比不翻更糟。
+   */
+  translateMaxChars: number
+  /** 单次翻译请求的超时（毫秒）。超时/失败都只在面板上标一下，不重试 —— 重试由用户切开关触发。 */
+  translateTimeoutMs: number
+  /** 翻译缓存文件路径。`''` = 默认的 `~/.dsh/think-flow/translations.json`。 */
+  translateCachePath: string
+  /**
+   * 翻译缓存最多保留多少条（按原文 LRU）。0 = 不限。
+   *
+   * 一条 = 一个段落（通常 200~1500 字），4000 条约 3~6MB ——
+   * 面板翻历史时大多数段落直接命中，不再走网络。
+   */
+  maxTranslationEntries: number
 }
 
 /** 配置（缺省值即推荐值）。 */
@@ -177,6 +217,12 @@ export const Config = z.object({
   // 640 = 会话 LRU 上限 32 × 每会话轮数上限 20 —— 两个上限对齐，
   // 这样"还能在面板里翻到的轮"标题都不会被淘汰（实测 57 轮才 69KB，不差这点）
   maxTitledTurns: z.number().min(0).max(10000).default(640),
+  translateTarget: z.string().default('zh-CN'),
+  translateProvider: z.string().default(''),
+  translateMaxChars: z.number().min(200).max(4000).default(3600),
+  translateTimeoutMs: z.number().min(1000).max(120000).default(20000),
+  translateCachePath: z.string().default(''),
+  maxTranslationEntries: z.number().min(0).max(100000).default(4000),
 })
 
 /** 一个 SSE 订阅者。 */
@@ -353,10 +399,109 @@ export function apply(ctx: Context, rawConfig: Config): void {
     resyncMaxGapMs: rawConfig?.resyncMaxGapMs ?? 300_000,
     maxHydrateEvents: rawConfig?.maxHydrateEvents ?? 20000,
     maxTitledTurns: rawConfig?.maxTitledTurns ?? 640,
+    translateTarget: rawConfig?.translateTarget ?? 'zh-CN',
+    translateProvider: rawConfig?.translateProvider ?? '',
+    translateMaxChars: rawConfig?.translateMaxChars ?? 3600,
+    translateTimeoutMs: rawConfig?.translateTimeoutMs ?? 20000,
+    translateCachePath: rawConfig?.translateCachePath ?? '',
+    maxTranslationEntries: rawConfig?.maxTranslationEntries ?? 4000,
   }
 
   const sessions = new Map<string, SessionEntry>()
   const stats: Stats = { frames: 0, events: 0, gaps: 0, dropped: 0 }
+
+  // ───────────────────────── 思考原文机翻 ─────────────────────────
+
+  const translationPath = config.translateCachePath !== ''
+    ? config.translateCachePath
+    : join(homedir(), '.dsh', 'think-flow', 'translations.json')
+  const translations = new TranslationCache(translationPath, config.maxTranslationEntries)
+
+  /** translator 服务（官方 experimental bundle）；没装就是 undefined —— 插件照常工作。 */
+  function translatorService(): TranslatorLike | undefined {
+    return ctx.get('translator') as TranslatorLike | undefined
+  }
+
+  /** 单次请求的字符上限：本插件配置与 translator 自己的上限取较小值。 */
+  function translateLimit(service: TranslatorLike | undefined): number {
+    const own = config.translateMaxChars > 0 ? config.translateMaxChars : 3600
+    const theirs = service?.maxTextChars
+    return typeof theirs === 'number' && theirs > 0 ? Math.min(own, theirs) : own
+  }
+
+  /** 同一段原文的并发请求合并：客户端重渲染会同时问好几遍同一段。 */
+  const translating = new Map<string, Promise<string>>()
+
+  /**
+   * 翻一段原文（命中缓存直接返回）。
+   *
+   * 不传 `sessionId`：绑定会话会让 translator 往**会话日志**里写插件记录，
+   * 而本插件对会话只读（历史回看时那些会话往往还没激活，绑定了反而会失败）。
+   */
+  async function translateOne(text: string): Promise<{ text: string; cached: boolean }> {
+    const service = translatorService()
+    if (service === undefined) throw codedError('TRANSLATION_UNAVAILABLE', '翻译服务未启用')
+    const target = config.translateTarget
+    const provider = config.translateProvider
+    const key = translationKey(provider, target, text)
+    const hit = translations.get(key)
+    if (hit !== undefined) return { text: hit, cached: true }
+    let running = translating.get(key)
+    if (running === undefined) {
+      running = (async () => {
+        const spec = service.resolve({
+          text,
+          targetLanguage: target,
+          ...(provider !== '' ? { provider } : {}),
+        })
+        const out = await service.translate(spec, AbortSignal.timeout(config.translateTimeoutMs))
+        if (typeof out !== 'string') throw codedError('TRANSLATION_INVALID_RESPONSE', '翻译服务返回了非文本')
+        translations.set(key, out)
+        return out
+      })().finally(() => { translating.delete(key) })
+      translating.set(key, running)
+    }
+    return { text: await running, cached: false }
+  }
+
+  /** 带 `code` 的错误：客户端按 code 说话（不把提供方返回的正文漏给浏览器）。 */
+  function codedError(code: string, message: string): Error & { code: string } {
+    return Object.assign(new Error(message), { code })
+  }
+
+  /**
+   * 读 JSON 请求体（有上限）。
+   *
+   * 只给 `/translate` 用：一段 ≤ 4000 字，60KB 的上限把"有人拿它当上传口"挡在外面。
+   * 超限**继续把流读空**再拒绝（直接 destroy 会让浏览器看到连接被重置，拿不到 413）。
+   */
+  function readJsonBody(req: IncomingMessage, limit: number): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = []
+      let size = 0
+      let tooLarge = false
+      req.on('data', (chunk: Buffer) => {
+        if (tooLarge) return
+        size += chunk.length
+        if (size > limit) { tooLarge = true; chunks.length = 0; return }
+        chunks.push(chunk)
+      })
+      req.on('end', () => {
+        if (tooLarge) { reject(Object.assign(new Error('body too large'), { status: 413, code: 'BODY_TOO_LARGE' })); return }
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+        } catch {
+          reject(Object.assign(new Error('invalid json'), { status: 400, code: 'INVALID_JSON' }))
+        }
+      })
+      req.on('error', (error) => { reject(error) })
+    })
+  }
+
+  // 预热翻译缓存（读失败不影响启动）
+  void translations.load().catch(() => {})
+  ctx.effect(() => () => { void translations.dispose() }, `${name}: translation cache`)
+
 
   // ───────────────────────── 会话条目（LRU） ─────────────────────────
 
@@ -1689,6 +1834,49 @@ export function apply(ctx: Context, rawConfig: Config): void {
   }
 
   /**
+   * 翻译**一段**思考原文（面板按段落发）。
+   *
+   * 用 POST：正文里就是原文本身 —— 4000 字走 query 会顶穿 URL 长度上限。
+   * 只翻传进来的这一段，**不**按 turn/step 在宿主侧翻整份思考：
+   * 一次 7 万字的 turn 会变成上百次网络请求，而用户常常只展开其中一步。
+   *
+   * 没装 translator（官方 experimental bundle）时返回 503，
+   * 面板据此把「中文」开关禁用 —— 插件其余功能不受影响。
+   */
+  const handleTranslate = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'POST') { json(res, 405, { ok: false, error: 'method-not-allowed' }); return }
+    const service = translatorService()
+    if (service === undefined) { json(res, 503, { ok: false, error: 'translator-unavailable' }); return }
+    let body: unknown
+    try {
+      body = await readJsonBody(req, 60 * 1024)
+    } catch (error) {
+      const status = (error as { status?: number }).status ?? 400
+      json(res, status, { ok: false, error: status === 413 ? 'body-too-large' : 'invalid-json' })
+      return
+    }
+    const text = body !== null && typeof body === 'object' && typeof (body as { text?: unknown }).text === 'string'
+      ? (body as { text: string }).text
+      : ''
+    if (text.trim() === '') { json(res, 200, { ok: true, text: '', cached: true }); return }
+    const limit = translateLimit(service)
+    if (text.length > limit) {
+      json(res, 413, { ok: false, error: 'text-too-long', limit })
+      return
+    }
+    try {
+      const out = await translateOne(text)
+      json(res, 200, { ok: true, text: out.text, cached: out.cached })
+    } catch (error) {
+      // 诊断只回错误码：提供方正文 / 提交的原文都不往浏览器漏
+      const code = typeof (error as { code?: unknown }).code === 'string'
+        ? (error as { code: string }).code
+        : 'TRANSLATION_FAILED'
+      json(res, 502, { ok: false, error: 'translation-failed', code })
+    }
+  }
+
+  /**
    * 生成（或命中缓存）某一轮的中文标题。
    *
    * 用 POST：这是一次**会产生模型调用**的动作，不该被浏览器/代理当成可缓存的 GET。
@@ -1766,10 +1954,17 @@ export function apply(ctx: Context, rawConfig: Config): void {
        * 改宿主代码后 `dsh web` 必须重启（ESM 缓存），重启完用
        * `curl -s localhost:3080/think-flow/api/ping` 看这个号对不对。
        */
-      build: 22,
+      build: 23,
       sessions: sessions.size,
       stats,
       config,
+      translate: {
+        available: translatorService() !== undefined,
+        target: config.translateTarget,
+        provider: config.translateProvider,
+        maxChars: translateLimit(translatorService()),
+        cacheEntries: translations.size,
+      },
     })
   }
 
@@ -1800,6 +1995,10 @@ export function apply(ctx: Context, rawConfig: Config): void {
   ctx.effect(
     () => ctx.webServer.register({ kind: 'exact', path: `${API}/auto`, handler: handleAuto }),
     `${name}: auto route`,
+  )
+  ctx.effect(
+    () => ctx.webServer.register({ kind: 'exact', path: `${API}/translate`, handler: handleTranslate }),
+    `${name}: translate route`,
   )
   ctx.effect(
     () => ctx.webServer.register({ kind: 'exact', path: `${API}/ping`, handler: handlePing }),

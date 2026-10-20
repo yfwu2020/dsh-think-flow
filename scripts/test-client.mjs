@@ -4892,5 +4892,119 @@ console.log('\n㊿ 断流自愈（面板自己重连）')
   })()
 }
 
+// ───────────────────── ㊿+ 机翻：段落切法 ─────────────────────
+//
+// 机翻本身在宿主（/translate → 官方 translator），客户端只负责"把原文切成
+// 可翻译的片段"。这一段测试锁住切法：空行分段、在长的那段不送翻、
+// 超长段落退到空白处切且不劈开代理对。切错了的后果不是报错，是译文串段。
+console.log('\n㊿+ 机翻：段落切法')
+{
+  const frags = mod.__internals.fragmentsOf
+  ok('导出段落切法（纯函数）', typeof frags === 'function')
+
+  const two = frags('第一段。\n\n第二段。', false, 3600)
+  ok('空行分段：两段', two.length === 2, two)
+  ok('第一段完整、后缀是那个空行', two[0].text === '第一段。' && two[0].suffix === '\n\n' && two[0].complete === true, two[0])
+  ok('最后一段在没有流时也算完整', two[1].complete === true && two[1].suffix === '', two[1])
+
+  const running = frags('第一段。\n\n还在长的第二段', true, 3600)
+  ok('末段还在长 → 不送翻（complete=false）', running[1].complete === false, running[1])
+  ok('前面已定型的段落照常送翻', running[0].complete === true)
+
+  const long = frags('word '.repeat(2000), false, 100)
+  ok('超长段落被切成多片', long.length > 1, long.length)
+  ok('每片都不超过上限', long.every((f) => f.text.length <= 100), long.map((f) => f.text.length))
+  ok('每片都是完整可翻的', long.every((f) => f.complete === true))
+  ok('拼回去与原文逐字相同', long.map((f) => f.text + f.suffix).join('') === 'word '.repeat(2000))
+
+  // 代理对（emoji）不能被切成两半：切点前后调一位
+  const emoji = frags('a'.repeat(99) + '😀' + 'b'.repeat(20), false, 100)
+  ok('不把代理对切成两半', emoji.every((f) => !/[\uD800-\uDBFF]$/.test(f.text)), emoji.map((f) => f.text.slice(-2)))
+
+  // 本来就是中文的段落不送翻：中文思考送 zh-CN 只会白花请求，还可能被改写
+  const zh = mod.__internals.isMostlyChinese
+  ok('纯中文 → 不翻', zh('我需要先看一遍这个文件的结构。') === true)
+  ok('英文 → 翻', zh('I need to inspect the file structure first.') === false)
+  ok('英文里夹中文术语 → 仍然翻', zh('check the 缓存键 before dispatching the request') === false)
+  ok('纯符号 → 不翻（没有可翻的文字）', zh('```') === false)
+
+  // 目标语不是中文时，中文原文恰恰是要翻的：跳过规则只对 zh-* 生效
+  const needs = mod.__internals.needsTranslation
+  const T0 = mod.__internals.translateState.target
+  ok('目标是中文 → 中文段落跳过', needs('这段是中文。') === false)
+  mod.__internals.translateState.target = 'en'
+  ok('目标是英文 → 中文段落照翻', needs('这段是中文。') === true)
+  mod.__internals.translateState.target = T0
+
+  /*
+   * 显示文本的拼装：已翻好的段落用译文，没翻好的保留原文 —— 这正是"翻好一段
+   * 显示一段"的实现，也是面板上唯一会让中文/英文**混在同一块里**的地方。
+   * 直接喂缓存，不碰网络（`available` 手工置真）。
+   */
+  const T = mod.__internals.translateState
+  const compose = mod.__internals.composeThinking
+  T.available = true
+  T.pref = 'live'
+  T.cache.set('Hello world.', '你好，世界。')
+  const mixed = compose('Hello world.\n\nSecond paragraph.', false)
+  ok('已翻好的段落换成译文', mixed.text.includes('你好，世界。'), mixed)
+  ok('没翻好的段落保留原文（不整块等）', mixed.text.includes('Second paragraph.'), mixed)
+  ok('段落之间的空行原样保留', mixed.text.includes('你好，世界。\n\nSecond paragraph.'), mixed)
+  ok('报告"还有几段没翻好"（面板可据此给忙碌态）', mixed.pending === 1, mixed.pending)
+
+  T.pref = 'off'
+  const plain = compose('Hello world.\n\nSecond paragraph.', false)
+  T.pref = 'live'
+  ok('关掉机翻 → 原文一字不改', plain.text === 'Hello world.\n\nSecond paragraph.' && plain.pending === 0, plain)
+
+  /*
+   * 三态：关 → 开（按需）→ 实时 → 关。
+   *
+   * 按需的关键区别只有一条：**折叠态那条实时尾巴不翻**（tlTail 直接原文），
+   * 展开的块照翻（走 tlCompose）。这几条断言就是"按需"的定义。
+   */
+  const mode = mod.__internals.translateMode
+  const cycle = mod.__internals.cycleTranslateMode
+  const tail = mod.__internals.composeTail
+  const live = mod.__internals.liveTranslates
+
+  T.pref = null
+  ok('没设置过 → 默认实时', mode() === 'live')
+  cycle()
+  ok('点一下：实时 → 关', mode() === 'off')
+  cycle()
+  ok('再点一下：关 → 开（按需）', mode() === 'demand')
+  cycle()
+  ok('再点一下：开 → 实时', mode() === 'live')
+
+  const css = String(mod.__internals.CSS)
+  ok('实时态是实心蓝 + 呼吸（不是只靠呼吸区分）', css.includes('.tf-zh.is-live{') && css.includes('tf-zh-breathe'))
+  ok('呼吸尊重 reduced-motion', css.replace(/\s+/g, '').includes('@media(prefers-reduced-motion:reduce){.tf-zh.is-live{animation:none}}'))
+
+  T.pref = 'demand'
+  ok('按需模式：折叠尾巴不实时翻', live() === false)
+  T.queue.length = 0
+  T.queued.clear()
+  const tailShown = tail('Hello world.\n\nStreaming tail text.', true, 760)
+  ok('按需模式：尾巴原样输出（一个请求都不排）', tailShown.text === 'Hello world.\n\nStreaming tail text.' && tailShown.pending === 0, tailShown)
+  ok('按需模式：队列里没有东西', T.queue.length === 0, T.queue)
+  const expanded = compose('Hello world.\n\nExpanded paragraph.', false)
+  ok('按需模式：展开的块照常翻（已缓存段落用译文）', expanded.text.includes('你好，世界。'), expanded)
+
+  T.pref = 'live'
+  const liveTail = tail('Hello world.\n\nStreaming tail text.', true, 760)
+  ok('实时模式：折叠尾巴会翻（已缓存段落用译文）', liveTail.text.includes('你好，世界。'), liveTail)
+
+  /*
+   * 内存上界：失败标记是"别再自动重试"的便签，不是缓存 —— 提供方挂掉、用户一直
+   * 往下读时会一直往里加。它必须有上限，否则读一晚上历史就是几十万个字符串。
+   * 这里没有 window.fetch（测试环境），每次合成的段落都会走 tlFail。
+   */
+  for (let i = 0; i < 700; i += 1) compose('Unique failing paragraph ' + i + '.', false)
+  ok('失败标记有上限（不会无限涨）', T.failed.size <= 600 && T.failed.size > 0, T.failed.size)
+
+  mod.__internals.resetTranslations()
+}
+
 console.log(`\n${fail === 0 ? '✅' : '❌'}  ${pass} 通过 / ${fail} 失败\n`)
 process.exit(fail === 0 ? 0 : 1)
