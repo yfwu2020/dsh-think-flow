@@ -7,7 +7,7 @@
 [![release](https://img.shields.io/github/v/release/yfwu2020/dsh-think-flow?label=release)](https://github.com/yfwu2020/dsh-think-flow/releases)
 [![npm](https://img.shields.io/npm/v/@yfwu2020/dsh-think-flow?label=npm)](https://www.npmjs.com/package/@yfwu2020/dsh-think-flow)
 [![license](https://img.shields.io/badge/license-MIT-green)](./package.json)
-[![tests](https://img.shields.io/badge/tests-1293%20assertions-brightgreen)](./scripts)
+[![tests](https://img.shields.io/badge/tests-passing-brightgreen)](./tests)
 [![DSH plugin](https://img.shields.io/badge/DSH-plugin-8b5cf6)](https://github.com/yfwu2020/dsh-think-flow)
 
 ---
@@ -79,7 +79,7 @@
 
 > 上面这些图**不是另画的示意图**：由 `npm run shots` 用构建产物里**真正的组件**渲染、
 > 配宿主主题包里整段抓出来的真 token、headless Chrome 拍下来，宽度就是右侧栏真实的 **380px**。
-> 数据来自 `scripts/demo-data.mjs`，是**合成的**一段会话。
+> 数据来自 `scripts/preview/demo-data.mjs`，是**合成的**一段会话。
 
 ## 安装
 
@@ -88,7 +88,7 @@
 dsh plugin --profile web add @yfwu2020/dsh-think-flow
 
 # 或从 GitHub Release 的 tgz（同一个产物，不走 npm）
-dsh plugin --profile web add /path/to/yfwu2020-dsh-think-flow-0.3.1.tgz
+dsh plugin --profile web add /path/to/yfwu2020-dsh-think-flow-0.3.2.tgz
 
 # 或从本地目录（开发用：改完不用重装，只重建）
 dsh plugin --profile web add link:/path/to/dsh-think-flow
@@ -280,6 +280,8 @@ index（全轮骨架）    maxIndexTurns = 2000      ← 目录读它；正文�
 | `GET /stream?session=<id>` | **SSE**：先发一份快照，之后只发增量 |
 | `GET /trace?session=<id>` | 一次性快照（JSON） |
 | `GET /step?session&turn&step` | 按需取某一步的**完整**思考原文 |
+| `GET /turn?session&turn` | 从冷热缓存或日志按需取某一轮正文 |
+| `POST /translate` | 按段翻译思考原文（JSON 请求体，需启用 translator） |
 | `POST /titles?session&turn[&force=1]` | 生成某一轮的中文标题（**只补缺的**；`force=1` 整轮重算）。用 POST 是因为它会**产生模型调用**，不该被当成可缓存的 GET |
 | `POST /auto?session&on=1\|0` | 开关**自动标题**（默认关）。状态记在宿主侧，随快照回给面板 |
 | `GET /sessions` | 当前在跟踪哪些会话（轮数/步数/订阅者数） |
@@ -296,7 +298,7 @@ index（全轮骨架）    maxIndexTurns = 2000      ← 目录读它；正文�
 ## 它是怎么工作的
 
 ```
-┌─ 宿主半  src/index.ts + src/trace.ts + src/titles.ts ─────────────────┐
+┌─ 宿主半  src/index.ts → src/host/* + trace/titles/translate ─────────┐
 │                                                                       │
 │  ctx.on('agent/assistant-stream')  ─┐                                 │
 │  ctx.on('session/event')           ─┴→ 折成 turn → step →（思考+工具） │
@@ -308,7 +310,7 @@ index（全轮骨架）    maxIndexTurns = 2000      ← 目录读它；正文�
 │                 120ms 合并推送          连接时发一次        展开时才取   │
 └───────────────────────────────────────────────────────────────────────┘
                                  │
-┌─ 客户端半  src/client/index.js ─┴─────────────────────────────────────┐
+┌─ 客户端半  src/client/* → lib/client.js（ModuleLoader）──────────────┐
 │  右侧栏标签页（真组件）；样式**全部**来自宿主 --dsw-* token，深浅自动跟随 │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -383,47 +385,59 @@ index（全轮骨架）    maxIndexTurns = 2000      ← 目录读它；正文�
 
 | | |
 | --- | --- |
-| **会写盘的东西** | 只有一个**标题缓存**：`~/.dsh/think-flow/titles.json`（派生物，删了随时能重算；上限 `maxTitledTurns` 轮）。文件坏了会**静默从空缓存开始**并覆盖原文件（无备份）—— 丢了能重算，所以可以接受 |
+| **会写盘的东西** | **标题缓存** `~/.dsh/think-flow/titles.json` 与**译文缓存** `~/.dsh/think-flow/translations.json`，都是可重建的派生数据，分别受 `maxTitledTurns` / `maxTranslationEntries` 限制。缓存损坏时按空缓存处理；标题缓存直接写入，译文缓存通过临时文件替换 |
 | **会话数据** | **只读**。会话日志由宿主写，插件只读不写；内存里折出来的轨迹按 LRU 回收 |
-| **什么时候联网** | 只有「生成标题」/「实时」这一条路会调用模型（走宿主自己的 `llm` 服务与凭据）。除此之外一个外部请求都没有 |
+| **什么时候联网** | 「生成标题」/「实时」会通过宿主 `llm` 调用模型；启用中文机翻时，需要翻译的原文段落会通过宿主 translator 发往所选 Bing/Google 翻译端点。关闭机翻或命中译文缓存时不发起翻译请求 |
 | **遥测** | 没有。不上报任何东西 |
 | **`/ping`、`/sessions`** | 只报计数与 build 号，不含会话内容 |
 
 开发仓库里另有一层约定：**真实会话渲染出来的开发资料不进公开仓库、也不进 npm 包**
 （`.gitignore` / `.npmignore` 里单列一段），公开的预览页与截图一律用
-`scripts/demo-data.mjs` 里**合成**的数据。
+`scripts/preview/demo-data.mjs` 里**合成**的数据。
 
 ## 开发
 
 ```bash
-npm install                # devDependencies 里钉了构建所需的那几个 @deepseek-ai/*
+npm ci                     # 按 package-lock.json 安装项目依赖；开发验证使用 Node 22.14 / 24
 
-npm run build              # tsc 编译 host 半 + 拷贝 client 半 → lib/
-npm test                   # 模板反引号 + typecheck + 1124 条断言（全部离线）
+npm run build              # 项目内 tsc 编译宿主 + esbuild 打包客户端 → lib/
+npm test                   # 自动构建当前源码，再跑模板检查、行为测试和构建回归检查
 npm run preview            # 生成 docs/ui-preview.html（真组件 + 真主题 token，合成数据）
 npm run shots              # 重新生成 assets/*.png（README 那几张图）
-npm run align              # 布局对齐检查（真浏览器量 getBoundingClientRect，需先 preview）
+npm run align              # 布局对齐检查（需先 preview，并安装 Chrome 或设置 DSH_CHROME）
 ```
+
+完整测试及下面的领域测试命令都会先构建当前源码，不会读取过期的 `lib/`。构建使用项目锁定的 TypeScript 与 esbuild；不再扫描全局编译器或本机 npx 缓存。主题预览默认使用项目依赖，也可显式设置 `DSH_CHECKOUT` 选择另一份宿主主题。
 
 单独跑某一套：
 
 ```bash
-npm run test:trace     # 146 条：纯函数折叠（含工具失败、截断、步边界）
-npm run test:titles    #  45 条：提示词预算、响应解析容错、缓存指纹
-npm run test:routes    # 156 条：SSE 分帧、快照形状、按需取原文、LRU、节流、心跳、缓存
-npm run test:client    # 777 条：注册、渲染、交互、历史、目录、对比度（解析真 token 算）
+npm run test:trace     # 纯函数折叠（含工具失败、截断、步边界）
+npm run test:titles    # 提示词预算、响应解析容错、缓存指纹
+npm run test:routes    # SSE 分帧、快照形状、按需取原文、LRU、节流、心跳、缓存
+npm run test:client    # 注册、渲染、交互、历史、目录、对比度（解析真 token 算）
+npm run test:translate # 译文缓存与持久化
+npm run test:build     # 测试自动重建、类型错误中止、发布包边界
 ```
 
 | 路径 | |
 | --- | --- |
-| `src/index.ts` | 宿主：订阅事件、路由、标题生成与缓存、历史回看 |
+| `src/index.ts` | 宿主入口：组装服务、订阅事件 |
+| `src/host/` | 会话与历史恢复、标题/翻译服务、快照、HTTP/SSE、配置与内部类型 |
 | `src/trace.ts` | 折叠逻辑（**纯函数**，可单测） |
 | `src/titles.ts` | 标题提示词、预算、响应解析、内容指纹 |
-| `src/client/index.js` | 右侧栏标签页（手写的 ModuleLoader bundle，**没有 JSX / 打包器**） |
-| `scripts/demo-data.mjs` | **合成**演示会话（预览页与截图共用） |
-| `scripts/demo-scenes.mjs` | 演示场景定义（预览页与截图共用同一份，图不会和实物不一致） |
-| `scripts/preview-harness.mjs` | 跑构建产物里真组件的底座 + 宿主主题 token 提取 |
-| `scripts/gen-readme-shots.mjs` | 出 README 截图（headless Chrome，2× 出图） |
+| `src/client/index.js` | 客户端 ModuleLoader 注册与服务组装入口 |
+| `src/client/panel.js`、`components/` | 面板交互、步骤展示和历史目录 |
+| `src/client/rules/` | 工具与命令派生标题、阶段分组、格式化规则 |
+| `src/client/translation.js`、`host-navigation.js`、`view-state.js` | 翻译队列、宿主页面适配、视图状态 |
+| `src/client/styles.css`、`styles.js` | 宿主 token 样式及注入/卸载生命周期 |
+| `tests/` | 领域逻辑、路由、客户端与构建回归测试 |
+| `scripts/preview/demo-data.mjs` | **合成**演示会话（预览页与截图共用） |
+| `scripts/preview/demo-scenes.mjs` | 演示场景定义（预览页与截图共用同一份，图不会和实物不一致） |
+| `scripts/preview/preview-harness.mjs` | 跑构建产物里真组件的底座 + 宿主主题 token 提取 |
+| `scripts/preview/gen-readme-shots.mjs` | 出 README 截图（headless Chrome，2× 出图） |
+
+持续检查在普通 push / PR 时执行；发布流程使用同一份锁文件。`npm pack` / `npm publish` 会自动构建，发布包只包含运行时、类型、源码与必要元信息，开发工具与本地资料留在仓库。
 
 **怎么确认改动生效了**：`curl -s localhost:3080/think-flow/api/ping` 看 `build` 号 ——
 改宿主代码后 +1。**host 半要重启 `dsh web`**（热重载只重建 fiber，不重新 import 模块，
@@ -458,7 +472,7 @@ ESM 缓存里还是旧代码）；**client 半刷新页面即可**。
   那是**宿主的记录模型**（`dsh-client-ui-trajectory`），插件改不了。插件的对策是**不假设顺序**：
   目标行按行身份（`assistant\0轮\0步`）认，二分走不动时**兜底从头按位置扫一遍**。
   但模型里**根本没有**的行，谁也变不出来 —— 那种情况按上限安静放弃。
-- **三个定时器**（都挂在 `ctx.effect` 上，卸载即清）：标题节拍（`autoTickMs`）、
+- **宿主的三个定时器**（都挂在 `ctx.effect` 上，卸载即清）：标题节拍（`autoTickMs`）、
   冷轮按时间收回（`coldTtlMs/10`，封顶 5 分钟）、过期自愈扫描（`resyncSilenceMs`，封顶 10 秒）。
   内存有容量上限（LRU + 冷轮预算）；标题缓存文件坏掉会静默重置。
 - 需要 **web** profile（右侧栏 + webserver）；TUI 下没有这个面板。

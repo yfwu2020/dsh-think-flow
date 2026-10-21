@@ -61,14 +61,11 @@ jobs:
           fi
 
       # devDependencies 里钉了 @deepseek-ai/*（构建要它们的类型、测试要主题包）。
-      # 装完 node_modules/@deepseek-ai 是真实目录，build.sh 走"用本包 node_modules"那条路。
+      # 使用锁文件安装项目依赖；测试入口会调用项目内编译器并构建客户端。
       - name: 安装依赖
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
-      - name: 构建（tsc 编译 host + 拷贝 client bundle）
-        run: bash scripts/build.sh
-
-      - name: 测试（trace / titles / routes / client，全部离线）
+      - name: 构建并测试（领域逻辑 / 路由 / 客户端 / 发布包边界）
         run: npm test
 
       # 幂等：这个版本已经发过就跳过发布（tag 重推 / 手动重跑时不至于红一片）

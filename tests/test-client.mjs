@@ -12,7 +12,7 @@
  *   ② 喂真实形状的 SSE 数据，断言渲染出的元素树里有该有的东西
  *   ③ 逐条验证阶段分组规则
  */
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
@@ -118,33 +118,15 @@ globalThis.EventSource = FakeEventSource
 
 // ───────────────────── 跑真实 bundle ─────────────────────
 
-/**
- * 找宿主主题包（`dsh-client-ui-theme`）。下面两节要靠它解析**真 token** 算对比度。
- *
- * 三个来源：DSH_CHECKOUT → 本包 node_modules（`npm i` 装的 devDependency）→
- * `~/.npm/_npx/*` 里任意一份 npx 缓存（**通配**）。
- *
- * ⚠️ 兜底这条以前写死过某个缓存目录哈希（`~/.npm/_npx/<hash>/…`）—— 那是
- * **本机**的目录名，换台机器就失效，而失效的表现是"这两节静默跳过对比度断言"，
- * 测试照样全绿。通配之后它至少在别的机器上也真的会去找。
- * @returns 主题 bundle 路径；找不到返回 undefined。
- */
+/** Contrast assertions always use the checked-in dependency selection. */
 function themePath() {
-  const local = join(HERE, '..', 'node_modules/@deepseek-ai/dsh-client-ui-theme/lib/client.js')
   const candidates = [
     process.env.DSH_CHECKOUT && join(process.env.DSH_CHECKOUT, 'node_modules/@deepseek-ai/dsh-client-ui-theme/lib/client.js'),
-    local,
+    join(HERE, '..', 'node_modules/@deepseek-ai/dsh-client-ui-theme/lib/client.js'),
   ].filter(Boolean)
-  const hit = candidates.find((p) => existsSync(p))
-  if (hit) return hit
-  const npx = join(process.env.HOME || '', '.npm', '_npx')
-  if (existsSync(npx)) {
-    for (const hash of readdirSync(npx)) {
-      const p = join(npx, hash, 'node_modules/@deepseek-ai/dsh-client-ui-theme/lib/client.js')
-      if (existsSync(p)) return p
-    }
-  }
-  return undefined
+  const file = candidates.find((p) => existsSync(p))
+  if (!file) throw new Error('Theme dependency is missing. Run npm ci before testing.')
+  return file
 }
 
 const source = readFileSync(BUNDLE, 'utf8')
@@ -5005,6 +4987,29 @@ console.log('\n㊿+ 机翻：段落切法')
   ok('失败标记有上限（不会无限涨）', T.failed.size <= 600 && T.failed.size > 0, T.failed.size)
 
   mod.__internals.resetTranslations()
+}
+
+// The extracted translation controller must retain the host API prefix.
+{
+  mod.__internals.resetTranslations()
+  const previousFetch = sandboxWindow.fetch
+  const requests = []
+  sandboxWindow.fetch = async (url) => {
+    requests.push(url)
+    return { ok: true, json: async () => ({ ok: true, text: '测试译文' }) }
+  }
+  try {
+    const state = mod.__internals.translateState
+    state.available = true
+    state.pref = 'live'
+    mod.__internals.composeThinking('Verify the translation endpoint.', false)
+    await new Promise((resolve) => setImmediate(resolve))
+    ok('翻译请求发送到宿主 API 前缀', requests[0] === '/think-flow/api/translate', requests)
+    ok('成功响应写回译文缓存', state.cache.get('Verify the translation endpoint.') === '测试译文')
+  } finally {
+    sandboxWindow.fetch = previousFetch
+    mod.__internals.resetTranslations()
+  }
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'}  ${pass} 通过 / ${fail} 失败\n`)

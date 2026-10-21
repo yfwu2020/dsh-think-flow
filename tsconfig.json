@@ -17,12 +17,10 @@
     "skipLibCheck": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "sourceMap": true
+    "sourceMap": true,
+    "noEmitOnError": true
   },
   "include": [
-    "src/index.ts",
-    "src/trace.ts",
-    "src/titles.ts",
-    "src/translate.ts"
+    "src/**/*.ts"
   ]
 }

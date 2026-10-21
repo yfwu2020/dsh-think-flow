@@ -1,6 +1,6 @@
 {
   "name": "@yfwu2020/dsh-think-flow",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "DSH 思维链可视化：把模型的实时思考按 turn → step →（思考原文 + 工具调用）聚合成可读的右侧栏视图",
   "type": "module",
   "main": "./lib/index.js",
@@ -31,20 +31,7 @@
     "src",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE",
-    "scripts/build.sh",
-    "scripts/demo-data.mjs",
-    "scripts/demo-scenes.mjs",
-    "scripts/preview-harness.mjs",
-    "scripts/gen-ui-preview.mjs",
-    "scripts/gen-readme-shots.mjs",
-    "scripts/lint-templates.mjs",
-    "scripts/test-trace.mjs",
-    "scripts/test-titles.mjs",
-    "scripts/test-routes.mjs",
-    "scripts/test-client.mjs",
-    "scripts/test-translate.mjs",
-    "scripts/check-align.mjs"
+    "LICENSE"
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.2 <5",
@@ -61,21 +48,24 @@
     "@deepseek-ai/dsh-session": "0.1.7-rc.2",
     "@deepseek-ai/schemastery": "3.18.4",
     "@types/node": "^26.6.2",
+    "esbuild": "0.28.2",
     "typescript": "^5.9.3"
   },
   "scripts": {
-    "build": "bash scripts/build.sh",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint:templates": "node scripts/lint-templates.mjs",
-    "test": "npm run lint:templates && npm run typecheck && node scripts/test-trace.mjs && node scripts/test-titles.mjs && node scripts/test-routes.mjs && node scripts/test-translate.mjs && node scripts/test-client.mjs",
-    "test:trace": "node scripts/test-trace.mjs",
-    "test:titles": "node scripts/test-titles.mjs",
-    "test:routes": "node scripts/test-routes.mjs",
-    "test:translate": "node scripts/test-translate.mjs",
-    "test:client": "node scripts/test-client.mjs",
-    "preview": "node scripts/gen-ui-preview.mjs",
-    "shots": "node scripts/gen-readme-shots.mjs",
-    "align": "node scripts/check-align.mjs"
+    "test": "node scripts/test.mjs",
+    "test:trace": "node scripts/test.mjs trace",
+    "test:titles": "node scripts/test.mjs titles",
+    "test:routes": "node scripts/test.mjs routes",
+    "test:translate": "node scripts/test.mjs translate",
+    "test:client": "node scripts/test.mjs client",
+    "preview": "npm run build && node scripts/preview/gen-ui-preview.mjs",
+    "shots": "npm run build && node scripts/preview/gen-readme-shots.mjs",
+    "align": "node scripts/preview/check-align.mjs",
+    "test:build": "node --test tests/test-build.mjs",
+    "prepack": "npm run build"
   },
   "exports": {
     ".": {

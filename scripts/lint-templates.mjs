@@ -19,8 +19,10 @@ const HERE = dirname(fileURLToPath(import.meta.url))
  * ⚠️ 范围是 gen-*.mjs **加 *-shared.mjs**：共享模块里也放着模板字面量（ring-glow-shared.mjs
  *    的 OPTION_CSS 就是），只查 gen-* 的话它拦不住 —— 实测漏过一次（代价是一个 SyntaxError）。
  */
-const files = readdirSync(HERE).filter((f) => f.endsWith('.mjs')
-  && (f.startsWith('gen-') || f.endsWith('-shared.mjs')))
+const files = [HERE, join(HERE, 'preview')].flatMap((dir) =>
+  readdirSync(dir).filter((f) => f.endsWith('.mjs')
+    && (f.startsWith('gen-') || f.endsWith('-shared.mjs')))
+    .map((f) => join(dir, f)))
 
 /** 抽出所有 `const NAME = \` … \`` 的模板体（非贪婪，够用：这些模板里不嵌套模板）。 */
 function templates(src) {
@@ -34,7 +36,7 @@ function templates(src) {
 let bad = 0
 let checked = 0
 for (const f of files) {
-  const src = readFileSync(join(HERE, f), 'utf8')
+  const src = readFileSync(f, 'utf8')
   for (const t of templates(src)) {
     checked += 1
     /*
