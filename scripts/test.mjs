@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
-const suites = ['trace', 'titles', 'routes', 'translate', 'client']
+const suites = ['trace', 'titles', 'routes', 'translate', 'client', 'shutdown']
 const selected = process.argv.slice(2)
 if (selected.some((name) => !suites.includes(name))) {
   console.error('Unknown test suite. Choose: ' + suites.join(', '))

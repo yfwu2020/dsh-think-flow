@@ -88,7 +88,7 @@
 dsh plugin --profile web add @yfwu2020/dsh-think-flow
 
 # 或从 GitHub Release 的 tgz（同一个产物，不走 npm）
-dsh plugin --profile web add /path/to/yfwu2020-dsh-think-flow-0.3.2.tgz
+dsh plugin --profile web add /path/to/yfwu2020-dsh-think-flow-0.3.3.tgz
 
 # 或从本地目录（开发用：改完不用重装，只重建）
 dsh plugin --profile web add link:/path/to/dsh-think-flow

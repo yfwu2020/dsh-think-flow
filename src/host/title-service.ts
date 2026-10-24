@@ -10,8 +10,38 @@ import type { Config } from './config.js'
 import type { SessionEntry, Subscriber, TitleCache, TitleCacheEntry } from './types.js'
 import { stepPrint, turnPrint, turnOutputOf } from './title-fingerprints.js'
 
+/**
+ * 让"等外部事件"的定时器**不参与进程存活判定**。
+ *
+ * 为什么必须要：宿主退出/热重载时先 dispose 插件，再等事件循环排空。一个没 `unref`
+ * 的长定时器（这里是 120s 的生成超时）会让进程空转到它到点为止 —— 外壳的优雅退出
+ * 期限（10s）早过了，于是记一条 `shutdown-lingering` 并把这次更新判失败。
+ * 同类毛病在 `dsh-selection-explain` 的 25s 截图轮询上真机踩过（2026-10）。
+ *
+ * 注意 `unref` 只解决"钉住进程"，不解决"生成还在跑"：后者由 `inflight` 的 dispose abort 兜。
+ * @param timer - 定时器。
+ */
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  timer.unref?.()
+}
+
 /** Owns title generation, cache and the opt-in batch scheduler. */
 export function createTitleService(ctx: Context, config: Config, sessions: Map<string, SessionEntry>, send: (sub: Subscriber, payload: unknown) => void) {
+  /**
+   * 此刻正在跑的标题生成。
+   *
+   * 卸载时一律 abort，这不是洁癖：`unref` 只让**定时器**不再钉住进程，而生成中的
+   * LLM 流本身还挂着 socket，同样会拖住退出（顺带继续烧 token）。abort 之后
+   * 流立即收尾、`generateBatch` 走 catch/finally，句柄全释放。
+   */
+  const inflight = new Set<AbortController>()
+  ctx.effect(() => () => {
+    for (const controller of inflight) {
+      try { controller.abort() } catch { /* 已经结束了 */ }
+    }
+    inflight.clear()
+  }, `${PLUGIN_NAME}: abort in-flight title generations`)
+
   /**
    * 标题缓存文件。
    *
@@ -170,7 +200,10 @@ export function createTitleService(ctx: Context, config: Config, sessions: Map<s
 
     const budget: TitleBudget = { perStepChars: config.titleStepChars, totalChars: config.titleTotalChars }
     const controller = new AbortController()
+    inflight.add(controller)
+    // 超时兜底交给 abort；`unref` 保证"生成还没回来就要退出"时不把宿主钉到 120s。
     const timer = setTimeout(() => controller.abort(), 120_000)
+    unrefTimer(timer)
     let raw = ''
     try {
       const stream = ctx.llm.stream({
@@ -194,6 +227,7 @@ export function createTitleService(ctx: Context, config: Config, sessions: Map<s
       return { ...empty, model, error: `生成失败：${String((error as Error)?.message ?? error)}` }
     } finally {
       clearTimeout(timer)
+      inflight.delete(controller)
     }
 
     // 没有思考的轮次（只有说明要翻）不检查 titles 条数
